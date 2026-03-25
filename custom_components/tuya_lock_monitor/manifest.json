@@ -1,7 +1,7 @@
 {
   "domain": "tuya_lock_monitor",
   "name": "Tuya Lock Monitor",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "documentation": "https://github.com/crestall/ha-tuya-lock-monitor",
   "requirements": ["tinytuya>=1.12.0"],
   "dependencies": [],

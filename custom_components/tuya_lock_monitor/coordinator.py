@@ -8,12 +8,13 @@ import json
 import logging
 import time
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 import aiohttp
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.util import dt as dt_util
 
 from .const import (
     CLOUD_META_REFRESH,
@@ -68,6 +69,7 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._local_reachable: bool = False
         self._last_local_poll: float = 0.0
         self._ping_task: asyncio.Task | None = None
+        self._last_contact: datetime | None = None
 
         # Cloud state
         self._cached_meta: dict[str, Any] = {}
@@ -87,6 +89,11 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # ------------------------------------------------------------------
     # Ping loop — started by __init__.py after first refresh
     # ------------------------------------------------------------------
+
+    @property
+    def last_contact(self) -> datetime | None:
+        """UTC datetime of the most recent successful data fetch from the device."""
+        return self._last_contact
 
     async def async_start_ping_loop(self) -> None:
         """Start the background 1-second ping loop."""
@@ -139,6 +146,7 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     status,
                     "local" if self._cloud_enabled else "local_only",
                 )
+                self._last_contact = dt_util.utcnow()
                 self.async_set_updated_data(result)
                 _LOGGER.debug("[TuyaPing] Local poll OK — pushed to listeners")
             except asyncio.CancelledError:
@@ -419,6 +427,7 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     return self.data
                 status = await self._local_get_status()
                 self._last_local_poll = now
+                self._last_contact = dt_util.utcnow()
                 return self._build_result(status, "local_only")
 
             # Device unreachable — return stale data so entities stay available,
@@ -457,8 +466,9 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     await self._refresh_cloud_meta(session)
                     token = await self._get_token(session)
                     status = await self._cloud_device_status(session, token)
+                self._last_contact = dt_util.utcnow()
                 return self._build_result(status, "cloud_fallback")
-            except aiohttp.ClientError as err:
+            except Exception as err:  # noqa: BLE001
                 if self.data:
                     _LOGGER.warning(
                         "[TuyaCloud] Cloud fallback also failed — returning stale data: %s", err
@@ -472,9 +482,15 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await self._refresh_cloud_meta(session)
                 token = await self._get_token(session)
                 status = await self._cloud_device_status(session, token)
-        except aiohttp.ClientError as err:
+        except Exception as err:  # noqa: BLE001
+            if self.data:
+                _LOGGER.warning(
+                    "[TuyaCloud] Cloud poll failed — returning stale data: %s", err
+                )
+                return self.data
             raise UpdateFailed(f"Network error: {err}") from err
 
+        self._last_contact = dt_util.utcnow()
         return self._build_result(status, "cloud")
 
     # ------------------------------------------------------------------

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -13,7 +14,7 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import DeviceInfo
+from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
@@ -92,9 +93,11 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coordinator: TuyaLockCoordinator = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities(
+    entities: list = [
         TuyaLockSensor(coordinator, entry, desc) for desc in SENSORS
-    )
+    ]
+    entities.append(TuyaLockLastContactSensor(coordinator, entry))
+    async_add_entities(entities)
 
 
 class TuyaLockSensor(CoordinatorEntity[TuyaLockCoordinator], SensorEntity):
@@ -129,8 +132,37 @@ class TuyaLockSensor(CoordinatorEntity[TuyaLockCoordinator], SensorEntity):
 
     @property
     def available(self) -> bool:
-        return (
-            super().available
-            and self.coordinator.data is not None
-            and self.coordinator.data.get("online", False)
+        return super().available and self.coordinator.data is not None
+
+
+class TuyaLockLastContactSensor(CoordinatorEntity[TuyaLockCoordinator], SensorEntity):
+    """Sensor showing when data was last successfully received from the device."""
+
+    _attr_has_entity_name = True
+    _attr_name = "Last Contact"
+    _attr_icon = "mdi:clock-check-outline"
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(
+        self,
+        coordinator: TuyaLockCoordinator,
+        entry: ConfigEntry,
+    ) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_last_contact"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name=coordinator.data["name"] if coordinator.data else entry.title,
+            model=coordinator.data["product_name"] if coordinator.data else None,
+            manufacturer="Tuya",
         )
+
+    @property
+    def native_value(self) -> datetime | None:
+        return self.coordinator.last_contact
+
+    @property
+    def available(self) -> bool:
+        # Available once we have had at least one successful contact
+        return self.coordinator.last_contact is not None

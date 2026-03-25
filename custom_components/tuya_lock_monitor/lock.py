@@ -53,11 +53,7 @@ class TuyaSmartLock(CoordinatorEntity[TuyaLockCoordinator], LockEntity):
 
     @property
     def available(self) -> bool:
-        return (
-            super().available
-            and self.coordinator.data is not None
-            and self.coordinator.data.get("online", False)
-        )
+        return super().available and self.coordinator.data is not None
 
     async def async_lock(self, **kwargs) -> None:
         """Disable passage mode (allow the lock to latch normally)."""
