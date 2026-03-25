@@ -19,8 +19,11 @@ Provides real-time lock status, unlock event counters, battery level, alarm even
 - Online / connectivity status
 - Lock entity with passage mode control (lock / unlock)
 - Config flow UI — no YAML required
-- **Local-only mode** — polls your lock directly over LAN every 15 seconds, no cloud account needed
-- **Cloud mode** — polls the Tuya OpenAPI every 60 seconds (or 15s if local IP is also provided)
+- **Built-in LAN scanner** — auto-discovers devices on your network; just enter the local key
+- **Ping-driven local mode** — TCP-pings the lock every second, polls tinytuya every 15 s when reachable
+- **Seamless cloud fallback** — switches to cloud automatically when local is unreachable, resumes local the moment the device comes back
+- **Local-only mode** — no cloud account needed; returns last known state while device is offline so entities never go unavailable
+- **Cloud mode** — polls the Tuya OpenAPI every 60 s when no local IP is set
 
 ---
 
@@ -29,6 +32,8 @@ Provides real-time lock status, unlock event counters, battery level, alarm even
 ### Local Only (recommended for privacy)
 
 Talk directly to the lock over your local network. No Tuya IoT Platform account required after the initial local key retrieval.
+
+The integration TCP-pings the lock every second and polls it every 15 s when reachable. If the lock is temporarily offline (power loss, Wi-Fi drop, etc.) the last known state is kept in HA so entities stay visible — and polling resumes the moment the device comes back online.
 
 **What you need:**
 | Item | How to find it |
@@ -60,8 +65,13 @@ Uses the Tuya OpenAPI. Requires a free Tuya IoT Platform account.
    - Scan the QR code with your **Smart Life** or **Tuya Smart** app
 5. Note down your **Access ID**, **Access Secret**, and **Device ID**
 
-**Optional — add local IP in cloud mode:**  
-Enter your lock's LAN IP when setting up cloud mode to enable hybrid polling: local LAN at 15s intervals with automatic cloud fallback if the local connection fails.
+**Optional — add local IP in cloud mode (hybrid):**  
+Enter your lock's LAN IP when setting up cloud mode to enable ping-driven hybrid polling:
+- The integration TCP-pings port 6668 every second
+- When reachable → polls tinytuya every 15 s and pushes data immediately to HA
+- When unreachable → falls back to the Tuya cloud at 60 s intervals automatically
+- Resumes local polling instantly the moment the lock responds again — no restart required
+- If both local and cloud fail, the last known state is kept so entities stay available
 
 ---
 
@@ -198,8 +208,9 @@ The `last_alarm` sensor reports one of the following strings:
 
 **Lock stops responding in local-only mode**
 - The local key changes when the device is reset and re-paired. Go to **Configure** and enter the new key.
-- Check the IP hasn't changed — set a DHCP reservation in your router for the lock's MAC address.
+- Check the IP hasn't changed — set a DHCP reservation in your router for the lock's MAC address to keep it stable.
 - Try a different protocol version (3.3, 3.4, 3.5).
+- Check HA logs for `[TuyaPing]` or `[TuyaLocal]` entries to see what the ping loop is doing.
 
 **"No permissions" error (cloud mode)**
 - Make sure your Tuya IoT project is subscribed to the **IoT Core** API service
