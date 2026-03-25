@@ -1,0 +1,24 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Tuya Lock Monitor",
+        "description": "Connect to the Tuya OpenAPI to monitor your smart lock.\n\n**Where to find credentials:**\n1. Log in to the Tuya IoT Platform (iot.tuya.com)\n2. Go to **Cloud → Development → My Cloud Projects**\n3. Open your project → **Overview** tab\n4. Copy **Access ID** and **Access Secret**\n5. Find your **Device ID** in **Cloud → Development → Devices**",
+        "data": {
+          "access_id": "Access ID (Client ID)",
+          "access_secret": "Access Secret (Client Secret)",
+          "device_id": "Device ID",
+          "endpoint": "API Endpoint (region)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to the Tuya API. Check your endpoint and network.",
+      "invalid_auth": "Invalid Access ID or Secret. Check your Tuya IoT Platform credentials.",
+      "unknown": "An unexpected error occurred."
+    },
+    "abort": {
+      "already_configured": "This device is already configured."
+    }
+  }
+}

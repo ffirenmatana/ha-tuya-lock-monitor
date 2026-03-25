@@ -1,0 +1,11 @@
+{
+  "domain": "tuya_lock_monitor",
+  "name": "Tuya Lock Monitor",
+  "version": "1.0.0",
+  "documentation": "https://github.com/tuya/tuya-iot-python-sdk",
+  "requirements": [],
+  "dependencies": [],
+  "codeowners": [],
+  "iot_class": "cloud_polling",
+  "config_flow": true
+}
