@@ -1,8 +1,8 @@
 # Tuya Lock Monitor
 
-A Home Assistant custom component for monitoring **Tuya smart locks** via the [Tuya OpenAPI](https://developer.tuya.com/en/docs/cloud/).
+A Home Assistant custom component for monitoring **Tuya smart locks** — works fully locally over your LAN or via the Tuya cloud API.
 
-Provides real-time lock status, unlock event counters, battery level, alarm events, and doorbell state — all as native Home Assistant entities that update every 60 seconds.
+Provides real-time lock status, unlock event counters, battery level, alarm events, and doorbell state — all as native Home Assistant entities.
 
 > Tested with the **DL031HA Series 2** smart lock. Compatible with any Tuya lock in the `jtmspro` category.
 
@@ -19,13 +19,38 @@ Provides real-time lock status, unlock event counters, battery level, alarm even
 - Online / connectivity status
 - Lock entity with passage mode control (lock / unlock)
 - Config flow UI — no YAML required
-- Polls the Tuya OpenAPI every 60 seconds
+- **Local-only mode** — polls your lock directly over LAN every 15 seconds, no cloud account needed
+- **Cloud mode** — polls the Tuya OpenAPI every 60 seconds (or 15s if local IP is also provided)
 
 ---
 
-## Prerequisites
+## Connection Modes
 
-Before installing, you need a **Tuya IoT Platform** account with a cloud project set up:
+### Local Only (recommended for privacy)
+
+Talk directly to the lock over your local network. No Tuya IoT Platform account required after the initial local key retrieval.
+
+**What you need:**
+| Item | How to find it |
+|---|---|
+| Device ID | Tuya/Smart Life app → device details, or tinytuya wizard |
+| Local Key | See below |
+| Device IP | Router DHCP client table |
+| Protocol version | Usually `3.4` — try `3.3` or `3.5` if it doesn't connect |
+
+**How to get the local key** (one-time):
+- **Option A — tinytuya wizard:** Install tinytuya (`pip install tinytuya`) on any PC on the same network and run `python -m tinytuya wizard`. It does a one-time cloud login to retrieve the key, then you can keep the key without any ongoing cloud access.
+- **Option B — previous cloud setup:** If you already ran the cloud version of this integration, the local key appeared in your HA logs. Search for `local_key` in your HA debug logs.
+
+> **Note:** The local key changes if you reset the device and re-pair it to the app. If the lock stops responding locally, go to **Settings → Devices & Services → Tuya Lock Monitor → Configure** and update the key.
+
+---
+
+### Cloud Mode
+
+Uses the Tuya OpenAPI. Requires a free Tuya IoT Platform account.
+
+**Prerequisites:**
 
 1. Sign up at [iot.tuya.com](https://iot.tuya.com)
 2. Go to **Cloud → Development → Create Cloud Project**
@@ -34,11 +59,10 @@ Before installing, you need a **Tuya IoT Platform** account with a cloud project
 3. In your project → **Service API** tab → subscribe to **IoT Core**
 4. In your project → **Devices** tab → **Link Tuya App Account**
    - Scan the QR code with your **Smart Life** or **Tuya Smart** app
-   - Your devices will now appear in the project
-5. Note down your:
-   - **Access ID** (Client ID) — shown on the project Overview tab
-   - **Access Secret** (Client Secret) — shown on the project Overview tab
-   - **Device ID** — shown under Cloud → Devices
+5. Note down your **Access ID**, **Access Secret**, and **Device ID**
+
+**Optional — add local IP in cloud mode:**  
+Enter your lock's LAN IP when setting up cloud mode to enable hybrid polling: local LAN at 15s intervals with automatic cloud fallback if the local connection fails.
 
 ---
 
@@ -55,7 +79,7 @@ Before installing, you need a **Tuya IoT Platform** account with a cloud project
 ### Manual
 
 1. Download or clone this repository
-2. Copy the `tuya_lock_monitor` folder into your HA config directory:
+2. Copy the `custom_components/tuya_lock_monitor` folder into your HA config directory:
    ```
    config/custom_components/tuya_lock_monitor/
    ```
@@ -67,7 +91,18 @@ Before installing, you need a **Tuya IoT Platform** account with a cloud project
 
 1. Go to **Settings → Devices & Services → Add Integration**
 2. Search for **Tuya Lock Monitor**
-3. Fill in the form:
+3. Choose your connection mode:
+
+**Local only:**
+
+| Field | Description |
+|---|---|
+| Device ID | Your lock's device ID |
+| Local Key | The device's encryption key |
+| Lock LAN IP address | Local IP address of the lock |
+| Protocol version | Usually `3.4` |
+
+**Cloud:**
 
 | Field | Description |
 |---|---|
@@ -75,8 +110,14 @@ Before installing, you need a **Tuya IoT Platform** account with a cloud project
 | Access Secret | Client Secret from your Tuya IoT project |
 | Device ID | The ID of your lock device |
 | API Endpoint | Select your region (EU / US / CN / IN) |
+| Lock LAN IP address | Optional — enables fast local polling |
+| Protocol version | Optional — only used if local IP is set |
 
-4. Click **Submit** — the integration will validate your credentials and add the device
+4. Click **Submit** — the integration will validate the connection and add the device
+
+### Updating settings after setup
+
+Go to **Settings → Devices & Services → Tuya Lock Monitor → Configure** to update the local IP, local key, or protocol version without re-entering your cloud credentials.
 
 ---
 
@@ -154,16 +195,21 @@ The `last_alarm` sensor reports one of the following strings:
 
 ## Troubleshooting
 
-**"No permissions" error**
+**Lock stops responding in local-only mode**
+- The local key changes when the device is reset and re-paired. Go to **Configure** and enter the new key.
+- Check the IP hasn't changed — set a DHCP reservation in your router for the lock's MAC address.
+- Try a different protocol version (3.3, 3.4, 3.5).
+
+**"No permissions" error (cloud mode)**
 - Make sure your Tuya IoT project is subscribed to the **IoT Core** API service
 - Make sure your Smart Life app account is linked to the project via the **Link Tuya App Account** QR code
 
-**"Invalid Access ID or Secret" error**
+**"Invalid Access ID or Secret" error (cloud mode)**
 - Double-check you are using the correct Access ID and Secret from your project's Overview tab
 - Make sure your chosen endpoint region matches your project's Data Centre region
 
 **Entities unavailable**
-- Check that the lock is online in the Smart Life app
+- Check that the lock is online in the Smart Life app (cloud mode) or reachable on your network (local mode)
 - Check HA logs: **Settings → System → Logs** (filter by `tuya_lock_monitor`)
 
 **Enable debug logging** by adding to `configuration.yaml`:
