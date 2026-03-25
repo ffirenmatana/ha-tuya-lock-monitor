@@ -3,12 +3,14 @@
     "step": {
       "user": {
         "title": "Tuya Lock Monitor",
-        "description": "Connect to the Tuya OpenAPI to monitor your smart lock.\n\n**Where to find credentials:**\n1. Log in to the Tuya IoT Platform (iot.tuya.com)\n2. Go to **Cloud → Development → My Cloud Projects**\n3. Open your project → **Overview** tab\n4. Copy **Access ID** and **Access Secret**\n5. Find your **Device ID** in **Cloud → Development → Devices**",
+        "description": "Connect to the Tuya OpenAPI to monitor your smart lock.\n\n**Where to find credentials:**\n1. Log in to the Tuya IoT Platform (iot.tuya.com)\n2. Go to **Cloud → Development → My Cloud Projects**\n3. Open your project → **Overview** tab\n4. Copy **Access ID** and **Access Secret**\n5. Find your **Device ID** in **Cloud → Development → Devices**\n\n**Local IP** (optional): Enter the LAN IP of your lock for faster local polling (15s) instead of cloud polling (60s). Find it in your router's DHCP table.",
         "data": {
           "access_id": "Access ID (Client ID)",
           "access_secret": "Access Secret (Client Secret)",
           "device_id": "Device ID",
-          "endpoint": "API Endpoint (region)"
+          "endpoint": "API Endpoint (region)",
+          "local_ip": "Lock LAN IP address (optional — enables local mode)",
+          "local_version": "Local protocol version (optional)"
         }
       }
     },

@@ -10,6 +10,9 @@ from .const import (
     CONF_ACCESS_SECRET,
     CONF_DEVICE_ID,
     CONF_ENDPOINT,
+    CONF_LOCAL_IP,
+    CONF_LOCAL_VERSION,
+    DEFAULT_LOCAL_VERSION,
     DOMAIN,
 )
 from .coordinator import TuyaLockCoordinator
@@ -25,6 +28,8 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry.data[CONF_ACCESS_SECRET],
         entry.data[CONF_DEVICE_ID],
         entry.data[CONF_ENDPOINT],
+        local_ip=entry.data.get(CONF_LOCAL_IP) or None,
+        local_version=entry.data.get(CONF_LOCAL_VERSION, DEFAULT_LOCAL_VERSION),
     )
 
     await coordinator.async_config_entry_first_refresh()
