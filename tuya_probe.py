@@ -129,7 +129,7 @@ class TuyaWorker:
 # Main application
 # ---------------------------------------------------------------------------
 class TuyaProbeApp(tk.Tk):
-    POLL_MS = 15_000  # auto-refresh ms
+    STATUS_POLL_INTERVAL = 15  # seconds between auto status fetches when reachable
 
     def __init__(self):
         super().__init__()
@@ -138,11 +138,16 @@ class TuyaProbeApp(tk.Tk):
         self.minsize(1020, 680)
 
         self._worker = TuyaWorker()
-        self._poll_job: str | None = None
         self._last_dps: dict[str, Any] = {}
         self._profiles: dict[str, dict] = load_profiles()
         # dp_str -> tk variable (Bool/Int/StringVar)
         self._dps_widgets: dict[str, Any] = {}
+
+        # live monitor state
+        self._ping_running: bool = False
+        self._ping_thread: threading.Thread | None = None
+        self._last_status_time: float = 0.0
+        self._was_reachable: bool | None = None
 
         self._build_ui()
         self._refresh_profile_dropdown()
@@ -229,10 +234,10 @@ class TuyaProbeApp(tk.Tk):
 
         ttk.Button(btn_frame, text="Ping",       command=self._do_ping).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(btn_frame, text="Get Status", command=self._do_refresh).pack(side=tk.LEFT, padx=(0, 4))
-        self._auto_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(btn_frame, text=f"Auto ({self.POLL_MS // 1000}s)",
-                        variable=self._auto_var,
-                        command=self._toggle_auto).pack(side=tk.LEFT)
+        self._live_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(btn_frame, text="Live Monitor",
+                        variable=self._live_var,
+                        command=self._toggle_live_monitor).pack(side=tk.LEFT)
 
         self._ping_label = ttk.Label(btn_frame, text="  Unknown", foreground="gray")
         self._ping_label.pack(side=tk.RIGHT, padx=4)
@@ -701,28 +706,62 @@ class TuyaProbeApp(tk.Tk):
             except Exception:
                 pass
 
-    # -------------------------------------------- auto-refresh
-    def _toggle_auto(self):
-        if self._auto_var.get():
-            self._log(f"Auto-refresh ON ({self.POLL_MS // 1000} s)")
-            self._schedule_auto()
+    # -------------------------------------------------- live monitor
+    def _toggle_live_monitor(self):
+        if self._live_var.get():
+            self._start_live_monitor()
         else:
-            self._cancel_auto()
-            self._log("Auto-refresh OFF")
+            self._stop_live_monitor()
 
-    def _schedule_auto(self):
-        self._cancel_auto()
-        self._poll_job = self.after(self.POLL_MS, self._auto_poll)
+    def _start_live_monitor(self):
+        conn = self._conn()
+        if not conn:
+            self._live_var.set(False)
+            return
+        ip, device_id, local_key, version = conn
+        self._ping_running = True
+        self._last_status_time = 0.0
+        self._was_reachable = None
+        self._ping_thread = threading.Thread(
+            target=self._live_ping_loop,
+            args=(ip, device_id, local_key, version),
+            daemon=True,
+        )
+        self._ping_thread.start()
+        self._log(f"Live Monitor ON  --  pinging {ip} every 1 s, status every {self.STATUS_POLL_INTERVAL} s", "INFO")
 
-    def _cancel_auto(self):
-        if self._poll_job:
-            self.after_cancel(self._poll_job)
-            self._poll_job = None
+    def _stop_live_monitor(self):
+        self._ping_running = False
+        self._ping_thread = None
+        self._live_var.set(False)
+        self._log("Live Monitor OFF", "INFO")
 
-    def _auto_poll(self):
-        if self._auto_var.get():
-            self._do_refresh()
-            self._schedule_auto()
+    def _live_ping_loop(self, ip: str, device_id: str, local_key: str, version: float):
+        while self._ping_running:
+            time.sleep(1)
+            if not self._ping_running:
+                break
+
+            ok = self._worker.ping(ip)
+            self.after(0, self._set_ping_label, ok)
+
+            # log only on state transitions
+            if ok and not self._was_reachable:
+                if self._was_reachable is not None:  # suppress very first connect msg
+                    self.after(0, self._log, f"Device back online at {ip}", "OK")
+                # force immediate status fetch on (re)connect
+                self._last_status_time = 0.0
+            elif not ok and self._was_reachable:
+                self.after(0, self._log, f"Device offline at {ip}", "WARN")
+            self._was_reachable = ok
+
+            if ok and (time.time() - self._last_status_time) >= self.STATUS_POLL_INTERVAL:
+                self._last_status_time = time.time()
+                try:
+                    result = self._worker.get_status(ip, device_id, local_key, version)
+                    self.after(0, self._handle_status, result)
+                except Exception as exc:
+                    self.after(0, self._log, f"Live status error: {exc}", "ERROR")
 
     # --------------------------------- status tree double-click
     def _on_status_double_click(self, _event):
@@ -893,7 +932,7 @@ class TuyaProbeApp(tk.Tk):
 
     # ================================================================ close
     def _on_close(self):
-        self._cancel_auto()
+        self._stop_live_monitor()
         self.destroy()
 
 
