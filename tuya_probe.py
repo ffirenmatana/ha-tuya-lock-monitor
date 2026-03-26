@@ -760,6 +760,8 @@ class TuyaProbeApp(tk.Tk):
         # and ~0.3 s when online — plenty to catch a 5-second wake window.
         was_reachable = False
         stop_reason = "stopped normally"
+        HEARTBEAT_INTERVAL = 120  # log "still running" every 2 min when offline
+        last_heartbeat = time.time()
         try:
             while self._ping_running:
                 t0 = time.time()
@@ -770,8 +772,15 @@ class TuyaProbeApp(tk.Tk):
 
                     if ok and not was_reachable:
                         self.after(0, self._log, f"Device online at {ip}", "OK")
+                        last_heartbeat = time.time()
                     elif not ok and was_reachable:
                         self.after(0, self._log, f"Device offline at {ip}", "WARN")
+                    elif not ok and not was_reachable:
+                        # still offline — emit heartbeat periodically so user knows loop is alive
+                        if time.time() - last_heartbeat >= HEARTBEAT_INTERVAL:
+                            last_heartbeat = time.time()
+                            self.after(0, self._log,
+                                       f"Live Monitor still running -- waiting for {ip}", "INFO")
 
                     was_reachable = ok
                     self._was_reachable = ok
