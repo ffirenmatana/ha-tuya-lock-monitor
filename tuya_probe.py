@@ -116,7 +116,7 @@ class TuyaWorker:
         # 5-second online window reliably.
         d = tinytuya.Device(
             dev_id=device_id, address=ip, local_key=local_key, version=version,
-            connection_timeout=1, connection_retry_limit=0, connection_retry_delay=0,
+            connection_timeout=1, connection_retry_limit=1, connection_retry_delay=0,
         )
         try:
             r = d.status()
@@ -762,22 +762,23 @@ class TuyaProbeApp(tk.Tk):
         self._log("Live Monitor OFF", "INFO")
 
     def _live_ping_loop(self, ip: str, device_id: str, local_key: str, version: float):
+        # Start as False so first successful status() always logs "Device online"
+        was_reachable = False
+        self.after(0, self._log, f"  [DBG] status() poll loop started for {ip}", "INFO")
         while self._ping_running:
             t0 = time.time()
-            # status() IS the ping — reuses the same TCP connection so there
-            # is no race between "port open" and "protocol ready".
-            # With connection_timeout=1 and retry_limit=0 this returns in
-            # ~0.1 s on success and ~1 s on failure — perfect 1 s loop cadence.
+            # status() IS the ping — one TCP connection does both jobs, eliminating
+            # the race between a raw ping succeeding and the protocol window closing.
             result = self._worker.get_status(ip, device_id, local_key, version, log_cb=None)
             ok = "dps" in result
             self.after(0, self._set_ping_label, ok)
 
-            # log only on state transitions
-            if ok and not self._was_reachable:
-                if self._was_reachable is not None:
-                    self.after(0, self._log, f"Device back online at {ip}", "OK")
-            elif not ok and self._was_reachable:
+            # log state transitions
+            if ok and not was_reachable:
+                self.after(0, self._log, f"Device online at {ip}", "OK")
+            elif not ok and was_reachable:
                 self.after(0, self._log, f"Device offline at {ip}", "WARN")
+            was_reachable = ok
             self._was_reachable = ok
 
             if ok:
