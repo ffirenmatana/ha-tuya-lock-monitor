@@ -13,6 +13,7 @@ from typing import Any
 
 import aiohttp
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
 
@@ -368,8 +369,8 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._doorbell_reset_unsub is not None:
             self._doorbell_reset_unsub()  # type: ignore[operator]
             self._doorbell_reset_unsub = None
-        self._doorbell_reset_unsub = self.hass.async_call_later(
-            1, self._async_clear_doorbell
+        self._doorbell_reset_unsub = async_call_later(
+            self.hass, 1, self._async_clear_doorbell
         )
 
     @callback
