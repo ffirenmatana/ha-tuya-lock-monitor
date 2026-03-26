@@ -111,12 +111,15 @@ class TuyaWorker:
                 log_cb(msg, lvl)
 
         _log(f"  [DBG] Connecting to {ip}:6668  v{version}")
-        # connection_retry_limit=1 + connection_retry_delay=0 caps total wait to ~4 s max
-        # instead of the default 5 retries × 5 s delay = 30+ s hang
         d = tinytuya.Device(
             dev_id=device_id, address=ip, local_key=local_key, version=version,
             connection_timeout=2, connection_retry_limit=1, connection_retry_delay=0,
         )
+        # socketPersistent keeps the TCP connection open after status() so that
+        # updatedps() can reuse the same socket; disable retries BEFORE updatedps
+        # so if the device already closed the connection it fails fast (<0.1 s)
+        # instead of hanging 2 s trying to reconnect
+        d.set_socketPersistent(True)
         combined: dict = {}
         err = ""
         try:
@@ -131,13 +134,16 @@ class TuyaWorker:
                 _log(f"  [DBG] status() error: {err}", "WARN")
 
             if combined:
-                all_dps = [int(k) for k in DEVICE_MAPPING.keys()]
-                _log(f"  [DBG] Sending updatedps({all_dps}) ...")
-                d.updatedps(all_dps)
-                # Set retry limit to 0 AFTER updatedps so receive() fails fast
-                # (no reconnect attempts) when the device drops the connection
                 d.connection_retry_limit = 0
                 d.retry = False
+                all_dps = [int(k) for k in DEVICE_MAPPING.keys()]
+                _log(f"  [DBG] Sending updatedps({all_dps}) ...")
+                t_upd = time.time()
+                try:
+                    d.updatedps(all_dps)
+                except Exception as upd_exc:
+                    _log(f"  [DBG] updatedps() raised in {time.time()-t_upd:.2f}s: {upd_exc}", "WARN")
+                _log(f"  [DBG] updatedps() sent in {time.time()-t_upd:.2f}s -- now reading responses")
                 d.set_socketTimeout(1)
                 deadline = time.time() + 1.5
                 pkt_count = 0
@@ -146,11 +152,11 @@ class TuyaWorker:
                     r = d.receive()
                     _log(f"  [DBG] receive() pkt {pkt_count+1} in {time.time()-t0:.2f}s: {r}")
                     if not r or "Error" in r or "dps" not in r:
-                        _log(f"  [DBG] receive() loop ended (no more dps packets)")
+                        _log("  [DBG] receive() loop ended")
                         break
                     pkt_count += 1
                     combined.update({str(k): v for k, v in r["dps"].items()})
-                _log(f"  [DBG] updatedps complete — {pkt_count} extra packet(s), combined DPS count: {len(combined)}")
+                _log(f"  [DBG] done - {pkt_count} extra pkt(s), total DPS: {len(combined)}")
             else:
                 _log("  [DBG] Skipping updatedps (no DPS from status())")
         except Exception as exc:
