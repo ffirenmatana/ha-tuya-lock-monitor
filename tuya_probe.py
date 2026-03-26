@@ -738,10 +738,8 @@ class TuyaProbeApp(tk.Tk):
 
     def _live_ping_loop(self, ip: str, device_id: str, local_key: str, version: float):
         while self._ping_running:
-            time.sleep(1)
-            if not self._ping_running:
-                break
-
+            # ping first — no leading sleep so Live Monitor start and reconnects
+            # are acted on immediately without waiting a full second
             ok = self._worker.ping(ip)
             self.after(0, self._set_ping_label, ok)
 
@@ -762,6 +760,10 @@ class TuyaProbeApp(tk.Tk):
                     self.after(0, self._handle_status, result)
                 except Exception as exc:
                     self.after(0, self._log, f"Live status error: {exc}", "ERROR")
+
+            # sleep at the end — preserves ~1 s cadence without delaying first/reconnect check
+            if self._ping_running:
+                time.sleep(1)
 
     # --------------------------------- status tree double-click
     def _on_status_double_click(self, _event):
