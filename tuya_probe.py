@@ -102,8 +102,15 @@ class TuyaWorker:
         except OSError:
             return False
 
-    def get_status(self, ip: str, device_id: str, local_key: str, version: float) -> dict:
+    def get_status(self, ip: str, device_id: str, local_key: str, version: float,
+                    log_cb=None) -> dict:
         import tinytuya
+
+        def _log(msg, lvl="INFO"):
+            if log_cb:
+                log_cb(msg, lvl)
+
+        _log(f"  [DBG] Connecting to {ip}:6668  v{version}")
         # connection_retry_limit=1 + connection_retry_delay=0 caps total wait to ~4 s max
         # instead of the default 5 retries × 5 s delay = 30+ s hang
         d = tinytuya.Device(
@@ -113,23 +120,36 @@ class TuyaWorker:
         combined: dict = {}
         err = ""
         try:
+            _log("  [DBG] Calling status() ...")
             r = d.status()
+            _log(f"  [DBG] status() raw response: {r}")
             if r and "dps" in r:
                 combined.update({str(k): v for k, v in r["dps"].items()})
+                _log(f"  [DBG] status() got {len(r['dps'])} DPS: {dict(r['dps'])}")
             elif r:
                 err = r.get("Error", "unknown error")
+                _log(f"  [DBG] status() error: {err}", "WARN")
 
             if combined:
-                # ask device to push all known DPS values
-                d.updatedps([int(k) for k in DEVICE_MAPPING.keys()])
+                all_dps = [int(k) for k in DEVICE_MAPPING.keys()]
+                _log(f"  [DBG] Sending updatedps({all_dps}) ...")
+                d.updatedps(all_dps)
                 d.set_socketTimeout(1)
                 deadline = time.time() + 1.5
+                pkt_count = 0
                 while time.time() < deadline:
                     r = d.receive()
+                    _log(f"  [DBG] receive() pkt {pkt_count+1}: {r}")
                     if not r or "Error" in r or "dps" not in r:
+                        _log(f"  [DBG] receive() loop ended (no more dps packets)")
                         break
+                    pkt_count += 1
                     combined.update({str(k): v for k, v in r["dps"].items()})
+                _log(f"  [DBG] updatedps complete — {pkt_count} extra packet(s), combined DPS count: {len(combined)}")
+            else:
+                _log("  [DBG] Skipping updatedps (no DPS from status())")
         except Exception as exc:
+            _log(f"  [DBG] Exception: {exc}", "WARN")
             if not combined:
                 err = str(exc)
         finally:
@@ -677,8 +697,10 @@ class TuyaProbeApp(tk.Tk):
         self._run_thread(self._refresh_thread, ip, device_id, local_key, version)
 
     def _refresh_thread(self, ip, device_id, local_key, version):
+        def _log(msg, lvl="INFO"):
+            self.after(0, self._log, msg, lvl)
         try:
-            result = self._worker.get_status(ip, device_id, local_key, version)
+            result = self._worker.get_status(ip, device_id, local_key, version, log_cb=_log)
             self.after(0, self._handle_status, result)
         except Exception as exc:
             self.after(0, self._log, f"Get status failed: {exc}", "ERROR")
@@ -789,8 +811,11 @@ class TuyaProbeApp(tk.Tk):
 
             if ok and (time.time() - self._last_status_time) >= self.STATUS_POLL_INTERVAL:
                 self._last_status_time = time.time()
+                self.after(0, self._log, f"Fetching status from {ip} ...", "INFO")
+                def _log(msg, lvl="INFO"):
+                    self.after(0, self._log, msg, lvl)
                 try:
-                    result = self._worker.get_status(ip, device_id, local_key, version)
+                    result = self._worker.get_status(ip, device_id, local_key, version, log_cb=_log)
                     self.after(0, self._handle_status, result)
                 except Exception as exc:
                     self.after(0, self._log, f"Live status error: {exc}", "ERROR")
