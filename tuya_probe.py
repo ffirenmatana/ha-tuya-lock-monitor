@@ -106,8 +106,40 @@ class TuyaWorker:
         import tinytuya
         d = tinytuya.Device(dev_id=device_id, address=ip,
                             local_key=local_key, version=version)
-        d.set_socketTimeout(5)
-        return d.status()
+        d.set_socketTimeout(4)
+        d.set_socketPersistent(True)
+
+        combined: dict = {}
+        try:
+            # Initial status pull — usually returns only the last-changed DP
+            r = d.status()
+            if r and "dps" in r:
+                combined.update({str(k): v for k, v in r["dps"].items()})
+
+            # Ask device to push ALL known DPS values
+            all_dps = [int(k) for k in DEVICE_MAPPING.keys()]
+            d.updatedps(all_dps)
+
+            # Read response packets until the device stops sending (≤2 s window)
+            d.set_socketTimeout(2)
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                r = d.receive()
+                if not r:
+                    break
+                if "dps" in r:
+                    combined.update({str(k): v for k, v in r["dps"].items()})
+        except Exception:
+            pass
+        finally:
+            try:
+                d.close()
+            except Exception:
+                pass
+
+        if combined:
+            return {"dps": combined}
+        return {"Error": "No DPS received from device"}
 
     def set_value(self, ip: str, device_id: str, local_key: str,
                   version: float, dp: int, value: Any) -> dict:
