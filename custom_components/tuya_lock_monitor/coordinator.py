@@ -1,4 +1,4 @@
-"""Tuya Lock Monitor coordinator — ping-driven local polling with cloud fallback."""
+﻿"""Tuya Lock Monitor coordinator — ping-driven local polling with cloud fallback."""
 from __future__ import annotations
 
 import asyncio
