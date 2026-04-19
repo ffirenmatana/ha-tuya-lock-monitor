@@ -23,6 +23,11 @@ from .const import (
     DOMAIN,
     DPS_TO_CODE,
     PING_INTERVAL,
+    SMART_LOCK_DOOR_OPERATE_PATH,
+    SMART_LOCK_TICKET_PATH,
+    STATE_WATCH_DURATION,
+    STATE_WATCH_INTERVAL,
+    STATUS_LOCK_MOTOR_STATE,
     UPDATE_INTERVAL,
 )
 
@@ -30,17 +35,7 @@ _LOGGER = logging.getLogger(__name__)
 
 
 class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
-    """Coordinator with 1-second TCP-ping loop for instant local reachability detection.
-
-    Behaviour:
-    - If local IP is set: pings port 6668 every second.
-      - Ping OK  → polls tinytuya every LOCAL_POLL_INTERVAL seconds (default 15 s).
-      - Ping fail → falls back to cloud (if cloud credentials provided); never gives up
-                    on local — resumes local polling the moment the device responds again.
-    - If no local IP: cloud polls on UPDATE_INTERVAL (default 60 s).
-    - Local-only mode (no cloud creds): keeps trying local forever; returns stale data
-      while unreachable so entities don't go unavailable.
-    """
+    """Coordinator with 1-second TCP-ping loop for instant local reachability detection."""
 
     def __init__(
         self,
@@ -68,11 +63,15 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._ping_task: asyncio.Task | None = None
         self._last_contact: datetime | None = None
 
-        # Doorbell auto-reset handle (set doorbell back to False after 1 s)
-        self._doorbell_reset_unsub: object | None = None
+        # Burst-poll state (used after smart-lock door-operate so we catch the
+        # auto-lock re-engagement before the next scheduled cloud poll).
+        self._state_watch_task: asyncio.Task | None = None
+        self._state_watch_until: float = 0.0
 
-        # Unlock-event auto-reset handles (reset code back to 0 after 1 s)
-        self._unlock_reset_unsubs: dict[str, object] = {}  # key → unsub callable
+        # Doorbell auto-reset handle
+        self._doorbell_reset_unsub: object | None = None
+        # Unlock-event auto-reset handles
+        self._unlock_reset_unsubs: dict[str, object] = {}
 
         # Cloud state
         self._cached_meta: dict[str, Any] = {}
@@ -84,22 +83,18 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             hass,
             _LOGGER,
             name=DOMAIN,
-            # The coordinator's scheduled updates handle cloud fallback / meta refresh.
-            # Local updates come from the ping loop via async_set_updated_data().
             update_interval=timedelta(seconds=UPDATE_INTERVAL),
         )
 
     # ------------------------------------------------------------------
-    # Ping loop — started by __init__.py after first refresh
+    # Ping loop
     # ------------------------------------------------------------------
 
     @property
     def last_contact(self) -> datetime | None:
-        """UTC datetime of the most recent successful data fetch from the device."""
         return self._last_contact
 
     async def async_start_ping_loop(self) -> None:
-        """Start the background 1-second ping loop."""
         if self._ping_task and not self._ping_task.done():
             return
         self._ping_task = self.hass.async_create_task(
@@ -108,22 +103,14 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         _LOGGER.debug("[TuyaPing] Ping loop started for %s", self._local_ip)
 
     def async_stop_ping_loop(self) -> None:
-        """Cancel the ping loop (called on unload)."""
         if self._ping_task and not self._ping_task.done():
             self._ping_task.cancel()
             _LOGGER.debug("[TuyaPing] Ping loop stopped")
+        if self._state_watch_task and not self._state_watch_task.done():
+            self._state_watch_task.cancel()
+            _LOGGER.debug("[TuyaWatch] State watch cancelled")
 
     async def _ping_loop(self) -> None:
-        """Status-as-ping loop: call tinytuya status() every ~1 s.
-
-        IMPORTANT: a raw TCP ping consumes the device's single Tuya protocol
-        session per wake cycle, leaving status() unable to connect afterwards.
-        Using status() directly serves as both reachability check and data fetch.
-
-        Timing (matching tuya_probe.py):
-          offline: ~0.6 s per attempt (2 × 0.3 s timeout) + 0.2 s sleep ≈ 0.8 s cadence
-          online:  ~0.1 s per attempt + 0.2 s sleep ≈ 0.3 s cadence
-        """
         while True:
             reachable = False
             status: dict[str, Any] = {}
@@ -303,7 +290,6 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # ------------------------------------------------------------------
 
     async def _local_get_status(self) -> dict[str, Any]:
-        """Fetch device status directly over LAN using tinytuya."""
         import tinytuya  # noqa: PLC0415
 
         device_id = self._device_id
@@ -336,7 +322,6 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return status
 
     async def _local_send_command(self, commands: list[dict]) -> None:
-        """Send commands to the device directly over LAN."""
         import tinytuya  # noqa: PLC0415
 
         device_id = self._device_id
@@ -364,12 +349,9 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         await self.hass.async_add_executor_job(_sync_send)
 
     # ------------------------------------------------------------------
-    # Doorbell auto-reset
+    # Auto-reset helpers
     # ------------------------------------------------------------------
 
-    # Status keys that must ONLY be set from local data when a local IP is
-    # configured.  Cloud status is never allowed to overwrite these so that
-    # a cloud poll between two local wakes doesn't erase the last-seen value.
     _LOCAL_ONLY_KEYS: frozenset[str] = frozenset({
         "doorbell",
         "unlock_fingerprint",
@@ -378,7 +360,6 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     })
 
     def _schedule_doorbell_reset(self) -> None:
-        """Cancel any pending doorbell reset and schedule a new one 1 s from now."""
         if self._doorbell_reset_unsub is not None:
             self._doorbell_reset_unsub()  # type: ignore[operator]
             self._doorbell_reset_unsub = None
@@ -388,7 +369,6 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     @callback
     def _async_clear_doorbell(self, _now: object = None) -> None:
-        """Reset doorbell to False in coordinator data after 1 second."""
         self._doorbell_reset_unsub = None
         if self.data and self.data.get("status", {}).get("doorbell"):
             new_status = {**self.data["status"], "doorbell": False}
@@ -397,7 +377,6 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             _LOGGER.debug("[TuyaDoorbell] Doorbell reset to False")
 
     def _schedule_unlock_reset(self, key: str) -> None:
-        """Schedule a reset of an unlock-event key back to 0 after 1 s."""
         old = self._unlock_reset_unsubs.pop(key, None)
         if old is not None:
             old()  # type: ignore[operator]
@@ -407,7 +386,6 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     @callback
     def _async_clear_unlock(self, key: str) -> None:
-        """Reset an unlock-event key to 0 in coordinator data after 1 second."""
         self._unlock_reset_unsubs.pop(key, None)
         if self.data and self.data.get("status", {}).get(key):
             new_status = {**self.data["status"], key: 0}
@@ -420,7 +398,7 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if status.get("doorbell"):
             self._schedule_doorbell_reset()
         for key in ("unlock_fingerprint", "unlock_password", "unlock_card"):
-            if status.get(key):  # non-zero / truthy means a fresh event arrived
+            if status.get(key):
                 self._schedule_unlock_reset(key)
         return {
             "device_id": self._device_id,
@@ -432,12 +410,6 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         }
 
     def _merge_local_status(self, new_status: dict[str, Any]) -> dict[str, Any]:
-        """Merge tinytuya DPS values onto the previous status dict.
-
-        tinytuya doesn't always return every DPS on every poll (e.g. unlock
-        counters may be absent). Merging preserves existing values for any key
-        not included in the new response so entity states don't flip to None.
-        """
         if self.data and "status" in self.data:
             merged = dict(self.data["status"])
             merged.update(new_status)
@@ -445,7 +417,6 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return new_status
 
     async def _refresh_cloud_meta(self, session: aiohttp.ClientSession) -> None:
-        """Fetch device info from cloud and cache metadata + local_key."""
         token = await self._get_token(session)
         info = await self._cloud_device_info(session, token)
         self._cached_meta = info
@@ -459,18 +430,8 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # ------------------------------------------------------------------
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Called on the 60-second schedule.
-
-        The ping loop handles all local updates via async_set_updated_data().
-        This method handles:
-        - Cloud-only mode (no local IP)
-        - Cloud fallback when local is unreachable
-        - Periodic cloud metadata refresh (renews local_key from cloud)
-        - Local-only mode when device is unreachable (returns stale data)
-        """
         now = time.time()
 
-        # ── Local-only mode (no cloud credentials) ──────────────────────
         if not self._cloud_enabled:
             if not self._local_ip or not self._local_key:
                 raise UpdateFailed(
@@ -478,8 +439,6 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "Use Configure to update them."
                 )
             if self._local_reachable:
-                # Ping loop is actively polling; return current data if we have it,
-                # otherwise do a one-off poll to satisfy the first-refresh requirement.
                 if self.data:
                     return self.data
                 status = await self._local_get_status()
@@ -487,8 +446,6 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._last_contact = dt_util.utcnow()
                 return self._build_result(status, "local_only")
 
-            # Device unreachable — return stale data so entities stay available,
-            # or raise on first call (no data yet).
             if self.data:
                 _LOGGER.debug(
                     "[TuyaLocal] Device unreachable — returning stale data while retrying"
@@ -499,13 +456,10 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self._local_ip
             )
 
-        # ── Cloud credentials available ──────────────────────────────────
         need_meta = not self._cached_meta or (now - self._last_meta_refresh) > CLOUD_META_REFRESH
 
         if self._local_ip:
-            # Hybrid mode — ping loop drives local updates.
             if self._local_reachable and self.data:
-                # Refresh cloud meta periodically (renews local_key).
                 if need_meta:
                     try:
                         async with aiohttp.ClientSession() as session:
@@ -516,15 +470,12 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         )
                 return self.data
 
-            # Local unreachable — cloud fallback; never give up on local.
             _LOGGER.info("[TuyaCloud] Local unreachable — polling cloud as fallback")
             try:
                 async with aiohttp.ClientSession() as session:
                     await self._refresh_cloud_meta(session)
                     token = await self._get_token(session)
                     cloud_status = await self._cloud_device_status(session, token)
-                # Don't let cloud overwrite locally-observed events (doorbell,
-                # unlock codes) — preserve whatever the local loop last set.
                 if self.data:
                     local_status = self.data.get("status", {})
                     for k in self._LOCAL_ONLY_KEYS:
@@ -541,7 +492,6 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     return self.data
                 raise UpdateFailed(f"Both local and cloud unavailable: {err}") from err
 
-        # ── Cloud-only mode (no local IP) ────────────────────────────────
         try:
             async with aiohttp.ClientSession() as session:
                 await self._refresh_cloud_meta(session)
@@ -558,11 +508,176 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return self._build_result(status, "cloud")
 
     # ------------------------------------------------------------------
+    # Smart Lock cloud API — ticket-based remote unlock (DL026HA family)
+    # ------------------------------------------------------------------
+
+    async def _smart_lock_get_ticket(
+        self, session: aiohttp.ClientSession, token: str
+    ) -> str:
+        """Fetch a short-lived unlock ticket for the Smart Lock API.
+
+        The ticket endpoint is POSTed with no body (matching the verified
+        curl); the signature must therefore hash an empty body too.
+        """
+        path = SMART_LOCK_TICKET_PATH.format(device_id=self._device_id)
+        ts = str(int(time.time() * 1000))
+        nonce = uuid.uuid4().hex
+        sign = self._sign(ts, nonce, "POST", path, token)  # body="" default
+        headers = self._base_headers(ts, nonce, sign, token)
+        headers["Content-Type"] = "application/json"
+        _LOGGER.debug("[SmartLock] POST %s%s", self._endpoint, path)
+
+        async with session.post(self._endpoint + path, headers=headers) as resp:
+            raw = await resp.text()
+            _LOGGER.debug("[SmartLock] ticket status=%d response=%s", resp.status, raw)
+            data = json.loads(raw)
+
+        if not data.get("success"):
+            raise UpdateFailed(
+                f"Smart-lock ticket error {data.get('code')}: {data.get('msg')}"
+            )
+        result = data.get("result") or {}
+        ticket_id = result.get("ticket_id")
+        if not ticket_id:
+            raise UpdateFailed(f"Smart-lock ticket response missing ticket_id: {result}")
+        return ticket_id
+
+    async def async_smart_lock_door_operate(self, open_lock: bool) -> bool:
+        if not self._cloud_enabled:
+            _LOGGER.error(
+                "[SmartLock] Remote unlock requires cloud credentials — "
+                "the Smart Lock API is cloud-only."
+            )
+            return False
+
+        path = SMART_LOCK_DOOR_OPERATE_PATH.format(device_id=self._device_id)
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                token = await self._get_token(session)
+                ticket_id = await self._smart_lock_get_ticket(session, token)
+                body = json.dumps({"ticket_id": ticket_id, "open": bool(open_lock)})
+
+                ts = str(int(time.time() * 1000))
+                nonce = uuid.uuid4().hex
+                sign = self._sign(ts, nonce, "POST", path, token, body)
+                headers = self._base_headers(ts, nonce, sign, token)
+                headers["Content-Type"] = "application/json"
+                _LOGGER.debug(
+                    "[SmartLock] POST %s%s body=%s", self._endpoint, path, body
+                )
+
+                async with session.post(
+                    self._endpoint + path, headers=headers, data=body
+                ) as resp:
+                    raw = await resp.text()
+                    _LOGGER.debug(
+                        "[SmartLock] door-operate status=%d response=%s",
+                        resp.status, raw,
+                    )
+                    data = json.loads(raw)
+
+            if not data.get("success"):
+                _LOGGER.error(
+                    "[SmartLock] door-operate failed code=%s msg=%s",
+                    data.get("code"), data.get("msg"),
+                )
+                return False
+
+            # Optimistically reflect the commanded motor state so the UI
+            # updates instantly, then burst-poll briefly to catch the
+            # auto-lock re-engagement.
+            if self.data is not None and self.data.get("status") is not None:
+                new_status = {
+                    **self.data["status"],
+                    STATUS_LOCK_MOTOR_STATE: not bool(open_lock),
+                }
+                self.async_set_updated_data({**self.data, "status": new_status})
+
+            await self.async_watch_lock_state()
+            return True
+
+        except aiohttp.ClientError as err:
+            _LOGGER.error("[SmartLock] Network error: %s", err)
+            return False
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.error("[SmartLock] Unexpected error: %s", err)
+            return False
+
+    # ------------------------------------------------------------------
+    # State watch — burst-poll cloud status after a door-operate call
+    # ------------------------------------------------------------------
+
+    async def async_watch_lock_state(
+        self,
+        duration: float = STATE_WATCH_DURATION,
+        interval: float = STATE_WATCH_INTERVAL,
+    ) -> None:
+        """Poll cloud status rapidly for a bounded window.
+
+        Stops early as soon as we see ``lock_motor_state`` transition from
+        False (unlocked) to True (locked) — i.e. the auto-lock has
+        re-engaged — to keep API call count low. Calling while a watch is
+        already running simply extends the existing window.
+        """
+        if not self._cloud_enabled:
+            return
+
+        self._state_watch_until = max(
+            self._state_watch_until, time.time() + duration
+        )
+        if self._state_watch_task and not self._state_watch_task.done():
+            return
+
+        async def _watch() -> None:
+            last_state: Any = None
+            if self.data:
+                last_state = self.data.get("status", {}).get(STATUS_LOCK_MOTOR_STATE)
+            saw_unlocked = last_state is False
+            try:
+                async with aiohttp.ClientSession() as session:
+                    while time.time() < self._state_watch_until:
+                        try:
+                            token = await self._get_token(session)
+                            cloud_status = await self._cloud_device_status(
+                                session, token
+                            )
+                            if self.data is not None:
+                                local_status = self.data.get("status", {})
+                                merged = {**local_status, **cloud_status}
+                                for k in self._LOCAL_ONLY_KEYS:
+                                    if k in local_status:
+                                        merged[k] = local_status[k]
+                                self.async_set_updated_data(
+                                    {**self.data, "status": merged}
+                                )
+
+                            current = cloud_status.get(STATUS_LOCK_MOTOR_STATE)
+                            if current is False:
+                                saw_unlocked = True
+                            if saw_unlocked and current is True:
+                                _LOGGER.debug(
+                                    "[TuyaWatch] Auto-lock re-engaged; stopping"
+                                )
+                                return
+                        except Exception as err:  # noqa: BLE001
+                            _LOGGER.debug("[TuyaWatch] Poll error: %s", err)
+                        await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                return
+            finally:
+                _LOGGER.debug("[TuyaWatch] State watch ended")
+                self._state_watch_task = None
+
+        self._state_watch_task = self.hass.async_create_task(
+            _watch(), name="tuya_state_watch"
+        )
+
+    # ------------------------------------------------------------------
     # Command helper — local first (if reachable), cloud fallback
     # ------------------------------------------------------------------
 
     async def async_send_command(self, commands: list[dict]) -> bool:
-        """Send commands — local if reachable, cloud otherwise."""
         if self._local_ip and self._local_key and self._local_reachable:
             try:
                 await self._local_send_command(commands)

@@ -35,6 +35,10 @@ CLOUD_META_REFRESH = 300    # seconds — how often to refresh cloud metadata / 
 LOCAL_VERSIONS = ["3.3", "3.4", "3.5"]
 DEFAULT_LOCAL_VERSION = "3.4"
 
+# State-watch cadence (used after smart-lock door-operate on DL026HA)
+STATE_WATCH_DURATION = 20.0   # seconds — maximum burst-poll window
+STATE_WATCH_INTERVAL = 2.0    # seconds — cadence inside that window
+
 # DPS number → status code (from device local_strategy in diagnostics)
 DPS_TO_CODE: dict[str, str] = {
     "1": "unlock_fingerprint",
@@ -72,3 +76,13 @@ STATUS_UNLOCK_APP = "unlock_app"
 STATUS_HIJACK = "hijack"
 STATUS_DOORBELL = "doorbell"
 STATUS_NORMAL_OPEN_SWITCH = "normal_open_switch"
+
+# DL026HA (and similar BLE-gateway lock) status codes
+STATUS_LOCK_MOTOR_STATE = "lock_motor_state"        # bool — reflects the "lock status" enum
+STATUS_AUTOMATIC_LOCK = "automatic_lock"            # bool — auto-relatch on close
+STATUS_UNLOCK_BLE = "unlock_ble"                    # int counter — BLE unlock events
+STATUS_UNLOCK_PHONE_REMOTE = "unlock_phone_remote"  # int counter — remote app unlocks
+
+# Smart Lock cloud API paths (confirmed against DL026HA firmware on openapi.tuyaeu.com)
+SMART_LOCK_TICKET_PATH = "/v1.0/smart-lock/devices/{device_id}/password-ticket"
+SMART_LOCK_DOOR_OPERATE_PATH = "/v1.0/smart-lock/devices/{device_id}/password-free/door-operate"

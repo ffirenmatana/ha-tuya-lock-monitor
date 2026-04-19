@@ -1,7 +1,7 @@
 """Sensors for Tuya Lock Monitor."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
@@ -28,7 +28,6 @@ from .coordinator import TuyaLockCoordinator
 
 
 def _parse_name_map(raw: str) -> dict[str, str]:
-    """Parse a '1=Dad, 2=Mum, 3=Guest' string into a {code: name} dict."""
     result: dict[str, str] = {}
     for part in raw.split(","):
         part = part.strip()
@@ -44,8 +43,6 @@ def _parse_name_map(raw: str) -> dict[str, str]:
 @dataclass(frozen=True, kw_only=True)
 class TuyaLockSensorDescription(SensorEntityDescription):
     status_key: str = ""
-    # If set, the sensor looks up a user-defined code→name mapping from this
-    # entry option key and shows the name (or raw code if no name is assigned).
     names_conf_key: str | None = None
 
 
@@ -106,6 +103,19 @@ SENSORS: tuple[TuyaLockSensorDescription, ...] = (
         status_key="alarm_lock",
         icon="mdi:alarm-light",
     ),
+    TuyaLockSensorDescription(
+        key="unlock_ble",
+        name="Last Bluetooth Unlock",
+        status_key="unlock_ble",
+        icon="mdi:bluetooth-connect",
+    ),
+    TuyaLockSensorDescription(
+        key="unlock_phone_remote",
+        name="Remote App Unlocks",
+        status_key="unlock_phone_remote",
+        icon="mdi:cellphone-lock",
+        state_class=SensorStateClass.TOTAL_INCREASING,
+    ),
 )
 
 
@@ -115,16 +125,18 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coordinator: TuyaLockCoordinator = hass.data[DOMAIN][entry.entry_id]
+    status_keys: set[str] = set(
+        (coordinator.data or {}).get("status", {}).keys()
+    )
+    supported = [desc for desc in SENSORS if desc.status_key in status_keys]
     entities: list = [
-        TuyaLockSensor(coordinator, entry, desc) for desc in SENSORS
+        TuyaLockSensor(coordinator, entry, desc) for desc in supported
     ]
     entities.append(TuyaLockLastContactSensor(coordinator, entry))
     async_add_entities(entities)
 
 
 class TuyaLockSensor(CoordinatorEntity[TuyaLockCoordinator], SensorEntity):
-    """A sensor derived from a Tuya lock status key."""
-
     entity_description: TuyaLockSensorDescription
     _attr_has_entity_name = True
 
@@ -165,7 +177,6 @@ class TuyaLockSensor(CoordinatorEntity[TuyaLockCoordinator], SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
-        """Include raw code number as attribute when a name mapping is active."""
         if self.coordinator.data is None:
             return None
         names_key = self.entity_description.names_conf_key
@@ -182,8 +193,6 @@ class TuyaLockSensor(CoordinatorEntity[TuyaLockCoordinator], SensorEntity):
 
 
 class TuyaLockLastContactSensor(CoordinatorEntity[TuyaLockCoordinator], SensorEntity):
-    """Sensor showing when data was last successfully received from the device."""
-
     _attr_has_entity_name = True
     _attr_name = "Last Contact"
     _attr_icon = "mdi:clock-check-outline"
@@ -210,5 +219,4 @@ class TuyaLockLastContactSensor(CoordinatorEntity[TuyaLockCoordinator], SensorEn
 
     @property
     def available(self) -> bool:
-        # Available once we have had at least one successful contact
         return self.coordinator.last_contact is not None

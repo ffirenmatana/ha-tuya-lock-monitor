@@ -60,6 +60,20 @@ BINARY_SENSORS: tuple[TuyaLockBinarySensorDescription, ...] = (
         device_class=BinarySensorDeviceClass.CONNECTIVITY,
         icon="mdi:cloud-check",
     ),
+    TuyaLockBinarySensorDescription(
+        key="lock_motor_state",
+        name="Lock Motor State",
+        status_key="lock_motor_state",
+        device_class=BinarySensorDeviceClass.LOCK,
+        icon="mdi:lock-check",
+        invert=True,
+    ),
+    TuyaLockBinarySensorDescription(
+        key="automatic_lock",
+        name="Auto-lock Enabled",
+        status_key="automatic_lock",
+        icon="mdi:lock-clock",
+    ),
 )
 
 
@@ -69,16 +83,21 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     coordinator: TuyaLockCoordinator = hass.data[DOMAIN][entry.entry_id]
+    status_keys: set[str] = set(
+        (coordinator.data or {}).get("status", {}).keys()
+    )
+    supported = [
+        desc for desc in BINARY_SENSORS
+        if desc.status_key == "__online__" or desc.status_key in status_keys
+    ]
     async_add_entities(
-        TuyaLockBinarySensor(coordinator, entry, desc) for desc in BINARY_SENSORS
+        TuyaLockBinarySensor(coordinator, entry, desc) for desc in supported
     )
 
 
 class TuyaLockBinarySensor(
     CoordinatorEntity[TuyaLockCoordinator], BinarySensorEntity
 ):
-    """A binary sensor derived from a Tuya lock status key."""
-
     entity_description: TuyaLockBinarySensorDescription
     _attr_has_entity_name = True
 

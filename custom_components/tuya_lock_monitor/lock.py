@@ -1,5 +1,17 @@
-"""Lock entity for Tuya Lock Monitor."""
+"""Lock entity for Tuya Lock Monitor.
+
+Two control surfaces are supported, selected automatically based on which
+status keys the device actually reports:
+
+1. DL031HA-style locks — expose ``normal_open_switch`` as a writable
+   passage-mode boolean.
+2. DL026HA-style locks (BLE sub-devices behind a gateway) — report
+   ``lock_motor_state`` and are unlocked remotely via Tuya's Smart Lock
+   cloud API. Lock re-enables auto-latch via the ``automatic_lock`` DP.
+"""
 from __future__ import annotations
+
+import logging
 
 from homeassistant.components.lock import LockEntity
 from homeassistant.config_entries import ConfigEntry
@@ -8,8 +20,15 @@ from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from .const import DOMAIN
+from .const import (
+    DOMAIN,
+    STATUS_AUTOMATIC_LOCK,
+    STATUS_LOCK_MOTOR_STATE,
+    STATUS_NORMAL_OPEN_SWITCH,
+)
 from .coordinator import TuyaLockCoordinator
+
+_LOGGER = logging.getLogger(__name__)
 
 
 async def async_setup_entry(
@@ -22,12 +41,6 @@ async def async_setup_entry(
 
 
 class TuyaSmartLock(CoordinatorEntity[TuyaLockCoordinator], LockEntity):
-    """Represents the door lock via the normal_open_switch data point.
-
-    normal_open_switch = True  → lock held open (unlocked/passage mode)
-    normal_open_switch = False → lock operating normally (locked)
-    """
-
     _attr_has_entity_name = True
     _attr_name = "Door Lock"
 
@@ -43,26 +56,62 @@ class TuyaSmartLock(CoordinatorEntity[TuyaLockCoordinator], LockEntity):
             manufacturer="Tuya",
         )
 
+    def _status(self) -> dict:
+        if self.coordinator.data is None:
+            return {}
+        return self.coordinator.data.get("status") or {}
+
+    def _uses_smart_lock_api(self) -> bool:
+        status = self._status()
+        return (
+            STATUS_LOCK_MOTOR_STATE in status
+            and STATUS_NORMAL_OPEN_SWITCH not in status
+        )
+
     @property
     def is_locked(self) -> bool | None:
         if self.coordinator.data is None:
             return None
-        # normal_open_switch True = held open = NOT locked
-        open_mode = self.coordinator.data["status"].get("normal_open_switch", False)
+        status = self._status()
+
+        if STATUS_LOCK_MOTOR_STATE in status:
+            motor = status.get(STATUS_LOCK_MOTOR_STATE)
+            if motor is None:
+                return None
+            return bool(motor)
+
+        open_mode = status.get(STATUS_NORMAL_OPEN_SWITCH, False)
         return not open_mode
 
     @property
     def available(self) -> bool:
         return super().available and self.coordinator.data is not None
 
-    async def async_lock(self, **kwargs) -> None:
-        """Disable passage mode (allow the lock to latch normally)."""
+    async def async_unlock(self, **kwargs) -> None:
+        if self._uses_smart_lock_api():
+            _LOGGER.debug("[TuyaLock] DL026HA-style unlock via Smart Lock API")
+            ok = await self.coordinator.async_smart_lock_door_operate(open_lock=True)
+            if not ok:
+                _LOGGER.warning(
+                    "[TuyaLock] Smart-lock unlock did not succeed; "
+                    "see prior log lines for cloud response."
+                )
+            return
+
+        _LOGGER.debug("[TuyaLock] DL031HA-style unlock via normal_open_switch=True")
         await self.coordinator.async_send_command(
-            [{"code": "normal_open_switch", "value": False}]
+            [{"code": STATUS_NORMAL_OPEN_SWITCH, "value": True}]
         )
 
-    async def async_unlock(self, **kwargs) -> None:
-        """Enable passage mode (hold lock open)."""
+    async def async_lock(self, **kwargs) -> None:
+        if self._uses_smart_lock_api():
+            _LOGGER.debug("[TuyaLock] DL026HA-style lock via automatic_lock=True")
+            await self.coordinator.async_send_command(
+                [{"code": STATUS_AUTOMATIC_LOCK, "value": True}]
+            )
+            return
+
+        _LOGGER.debug("[TuyaLock] DL031HA-style lock via normal_open_switch=False")
         await self.coordinator.async_send_command(
-            [{"code": "normal_open_switch", "value": True}]
+            [{"code": STATUS_NORMAL_OPEN_SWITCH, "value": False}]
         )
