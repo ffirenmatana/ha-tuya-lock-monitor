@@ -1,4 +1,4 @@
-﻿"""Tuya Lock Monitor coordinator — ping-driven local polling with cloud fallback."""
+"""Tuya Lock Monitor coordinator — ping-driven local polling with cloud fallback."""
 from __future__ import annotations
 
 import asyncio
@@ -27,6 +27,7 @@ from .const import (
     SMART_LOCK_TICKET_PATH,
     STATE_WATCH_DURATION,
     STATE_WATCH_INTERVAL,
+    STATUS_AUTOMATIC_LOCK,
     STATUS_LOCK_MOTOR_STATE,
     UPDATE_INTERVAL,
 )
@@ -285,6 +286,92 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             )
         return {item["code"]: item["value"] for item in data["result"]}
 
+    async def _cloud_device_logs(
+        self,
+        session: aiohttp.ClientSession,
+        token: str,
+        codes: str,
+        size: int = 1,
+    ) -> list[dict]:
+        """Fetch device log entries matching one or more status codes.
+
+        Tuya persists every DP transition in /logs with the value encoded
+        as a string. Used to seed state on cold boot when the regular
+        /status endpoint hasn't surfaced a particular DP yet.
+        """
+        end_time = int(time.time() * 1000)
+        start_time = end_time - (30 * 24 * 3600 * 1000)  # last 30 days
+        query = (
+            f"codes={codes}&size={size}&type=7"
+            f"&start_time={start_time}&end_time={end_time}"
+        )
+        path = f"/v1.0/devices/{self._device_id}/logs"
+        ts = str(int(time.time() * 1000))
+        nonce = uuid.uuid4().hex
+        sign = self._sign(ts, nonce, "GET", f"{path}?{query}", token)
+        headers = self._base_headers(ts, nonce, sign, token)
+
+        async with session.get(
+            f"{self._endpoint}{path}?{query}", headers=headers
+        ) as resp:
+            raw = await resp.text()
+            _LOGGER.debug("[TuyaLogs] status=%d response=%s", resp.status, raw)
+            data = json.loads(raw)
+
+        if not data.get("success"):
+            _LOGGER.debug(
+                "[TuyaLogs] failed code=%s msg=%s",
+                data.get("code"), data.get("msg"),
+            )
+            return []
+        return data.get("result", {}).get("logs") or []
+
+    @staticmethod
+    def _coerce_log_value(raw: Any) -> Any:
+        """Logs return strings; map known booleans back, else pass through."""
+        if raw in ("true", "True"):
+            return True
+        if raw in ("false", "False"):
+            return False
+        if isinstance(raw, str) and raw.lstrip("-").isdigit():
+            return int(raw)
+        return raw
+
+    async def _seed_missing_state(
+        self,
+        session: aiohttp.ClientSession,
+        token: str,
+        status: dict[str, Any],
+    ) -> None:
+        """For DL026HA-family locks, seed lock_motor_state from the device
+        log when the /status endpoint hasn't returned it yet.
+
+        Mutates ``status`` in place. Best-effort — silently falls back if
+        the log query fails or returns nothing.
+        """
+        if STATUS_LOCK_MOTOR_STATE in status:
+            return
+        if STATUS_AUTOMATIC_LOCK not in status:
+            return  # not a DL026HA family device, don't bother
+        try:
+            logs = await self._cloud_device_logs(
+                session, token, STATUS_LOCK_MOTOR_STATE, size=1
+            )
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.debug("[TuyaSeed] logs query failed: %s", err)
+            return
+        if not logs:
+            _LOGGER.debug(
+                "[TuyaSeed] no lock_motor_state events in last 30 days"
+            )
+            return
+        value = self._coerce_log_value(logs[0].get("value"))
+        status[STATUS_LOCK_MOTOR_STATE] = value
+        _LOGGER.info(
+            "[TuyaSeed] Seeded lock_motor_state=%s from logs event at %s",
+            value, logs[0].get("event_time"),
+        )
+
     # ------------------------------------------------------------------
     # Local LAN calls (tinytuya)
     # ------------------------------------------------------------------
@@ -476,6 +563,7 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     await self._refresh_cloud_meta(session)
                     token = await self._get_token(session)
                     cloud_status = await self._cloud_device_status(session, token)
+                    await self._seed_missing_state(session, token, cloud_status)
                 if self.data:
                     local_status = self.data.get("status", {})
                     for k in self._LOCAL_ONLY_KEYS:
@@ -497,6 +585,7 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await self._refresh_cloud_meta(session)
                 token = await self._get_token(session)
                 status = await self._cloud_device_status(session, token)
+                await self._seed_missing_state(session, token, status)
         except Exception as err:  # noqa: BLE001
             if self.data:
                 _LOGGER.warning(
