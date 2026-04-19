@@ -74,6 +74,28 @@ class TuyaSmartLock(CoordinatorEntity[TuyaLockCoordinator], LockEntity):
             return None
         status = self._status()
 
+        # DL026HA family: lock_motor_state is authoritative.
+        if STATUS_LOCK_MOTOR_STATE in status:
+            motor = status.get(STATUS_LOCK_MOTOR_STATE)
+            if motor is None:
+                return None
+            return bool(motor)
+
+        # If this device reports automatic_lock, it's a DL026HA and the
+        # absence of lock_motor_state means we just haven't seen it yet
+        # (common on initial boot). Return None so the card shows
+        # "Unknown" rather than defaulting to "Locked" — that default was
+        # misleading users into a manual lock/unlock cycle on every restart.
+        if STATUS_AUTOMATIC_LOCK in status:
+            return None
+
+        # DL031HA fallback: passage-mode boolean. True means held open.
+        open_mode = status.get(STATUS_NORMAL_OPEN_SWITCH, False)
+        return not open_mode    def is_locked(self) -> bool | None:
+        if self.coordinator.data is None:
+            return None
+        status = self._status()
+
         if STATUS_LOCK_MOTOR_STATE in status:
             motor = status.get(STATUS_LOCK_MOTOR_STATE)
             if motor is None:
