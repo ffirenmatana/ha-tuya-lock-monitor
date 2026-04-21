@@ -1,280 +1,107 @@
-# Tuya Lock Monitor
+# Tuya Lock Monitor for Home Assistant
 
-A Home Assistant custom component for monitoring **Tuya smart locks** — works fully locally over your LAN or via the Tuya cloud API.
+A Home Assistant custom integration for Tuya Smart Locks, with support for the **DL026HA** family when paired with an **SG120HA** BLE-to-Wi-Fi gateway. Works in either **cloud** mode (via the Tuya IoT Platform OpenAPI) or **local** mode (via `tinytuya`).
 
-Provides real-time lock status, unlock event counters, battery level, alarm events, and doorbell state — all as native Home Assistant entities.
+This integration is a v2 rewrite of [**@crestall**'s original `ha-tuya-lock-monitor`](https://github.com/crestall/ha-tuya-lock-monitor). Huge thanks to crestall for the foundational work that made this possible — the DP mapping, the dual cloud/local coordinator design, and the config-flow UX all originate there.
 
-> Tested with the **DL031HA Series 2** smart lock. Compatible with any Tuya lock in the `jtmspro` category.
+## What's new in v2
 
----
+- **Shared user-name YAML** — a single `tuya_lock_users.yaml` drives fingerprint / password / card name resolution across every lock entry. No more per-entry duplication.
+- **Last-user event tracking** — the raw DP pulses to an ID and back to `0` in a fraction of a second; v2 captures the last non-zero ID and exposes it as the sensor state plus `id` / `person_name` / `last_seen` attributes.
+- **`tuya_lock_monitor_v2_unlock` bus event** — fires on every new unlock with `{entry_id, device_id, device_name, kind, id, time}` for easy automations.
+- **Passage Mode switch** — emulates passage mode by maxing `auto_lock_time` and re-issuing the unlock on a timer (DL026HA firmware treats `automatic_lock` as read-only, so the "real" approach doesn't work).
+- **Do Not Disturb switch** — toggles the DP of the same name when the device exposes it.
+- **Beep volume select** — `mute` / `normal`.
+- **Auto-lock time number** — slider for 1–1800 s.
+- **Auto-lock armed binary sensor** — read-only reflection of the `automatic_lock` status.
+- Domain renamed to `tuya_lock_monitor_v2` so it coexists cleanly with v1.
 
-## Features
+## Supported devices
 
-- Battery level sensor
-- Last unlock event sensors for fingerprint, password, and card — show the credential code used, with optional user-defined name labels
-- Unlock counters (app, temporary code)
-- Last alarm event (wrong finger, wrong password, pry, low battery, etc.)
-- Doorbell binary sensor — auto-resets to **Off** after 1 second
-- Deadbolt (reverse lock) state
-- Duress / hijack alert
-- Online / connectivity status
-- Lock entity with passage mode control (lock / unlock)
-- Config flow UI — no YAML required
-- **User-defined credential names** — assign names like "Dad", "Mum", or "Guest" to each stored fingerprint, password, and card code from the integration settings
-- **Built-in LAN scanner** — auto-discovers devices on your network; just enter the local key
-- **Ping-driven local mode** — status-polls the lock every ~1 s when reachable (status call serves as both ping and data fetch, avoiding the single-session limitation of Tuya devices)
-- **Seamless cloud fallback** — switches to cloud automatically when local is unreachable, resumes local the moment the device comes back
-- **Local-only mode** — no cloud account needed; returns last known state while device is offline so entities never go unavailable
-- **Cloud mode** — polls the Tuya OpenAPI every 60 s when no local IP is set
+- **DL026HA** — BLE smart lock, sub-device of an SG120HA gateway. Primary target.
+- **DL031HA** — legacy Wi-Fi lock. All v1 DPs carry forward; newer v2 control surfaces appear where the device reports them.
+- **SG120HA** — paired as a hub. Not controlled directly by this integration (use the core Tuya integration for the hub's switch/light DPs).
 
----
-
-## Connection Modes
-
-### Local Only (recommended for privacy)
-
-Talk directly to the lock over your local network. No Tuya IoT Platform account required after the initial local key retrieval.
-
-The integration TCP-pings the lock every second and polls it every 15 s when reachable. If the lock is temporarily offline (power loss, Wi-Fi drop, etc.) the last known state is kept in HA so entities stay visible — and polling resumes the moment the device comes back online.
-
-**What you need:**
-| Item | How to find it |
-|---|---|
-| Local Key | See below |
-
-> **Device ID and IP are found automatically** by the built-in network scanner — just select "Scan network" during setup and pick your lock from the list.
-
-**How to get the local key** (one-time):
-- **Option A — tinytuya wizard:** Install tinytuya (`pip install tinytuya`) on any PC on the same network and run `python -m tinytuya wizard`. It does a one-time cloud login to retrieve the key, then you can keep the key without any ongoing cloud access.
-- **Option B — previous cloud setup:** If you already ran the cloud version of this integration, the local key appeared in your HA logs. Search for `local_key` in your HA debug logs.
-
-> **Note:** The local key changes if you reset the device and re-pair it to the app. If the lock stops responding locally, go to **Settings → Devices & Services → Tuya Lock Monitor → Configure** and update the key.
-
----
-
-### Cloud Mode
-
-Uses the Tuya OpenAPI. Requires a free Tuya IoT Platform account.
-
-**Prerequisites:**
-
-1. Sign up at [iot.tuya.com](https://iot.tuya.com)
-2. Go to **Cloud → Development → Create Cloud Project**
-   - Select your region (e.g. Europe)
-   - Data Centre: **Central Europe Data Centre** (for EU users)
-3. In your project → **Service API** tab → subscribe to **IoT Core**
-4. In your project → **Devices** tab → **Link Tuya App Account**
-   - Scan the QR code with your **Smart Life** or **Tuya Smart** app
-5. Note down your **Access ID**, **Access Secret**, and **Device ID**
-
-**Optional — add local IP in cloud mode (hybrid):**  
-Enter your lock's LAN IP when setting up cloud mode to enable ping-driven hybrid polling:
-- The integration polls tinytuya (using `status()` as the ping) approximately every second
-- When reachable → pushes status data immediately to HA
-- When unreachable → falls back to the Tuya cloud at 60 s intervals automatically
-- Resumes local polling instantly the moment the lock responds again — no restart required
-- If both local and cloud fail, the last known state is kept so entities stay available
-
----
+Every DP is surfaced conditionally — entities only appear when the device reports the matching status code, so no phantom controls on models that don't support a feature.
 
 ## Installation
 
-### Via HACS (recommended)
+1. Copy the `tuya_lock_monitor_v2/` folder into `<config>/custom_components/`.
+2. (Optional) Copy `tuya_lock_monitor_v2/tuya_lock_users.yaml.example` to `<config>/tuya_lock_users.yaml` and fill in your user IDs. No `configuration.yaml` entry is required.
+3. Restart Home Assistant.
+4. **Settings → Devices & Services → Add Integration → Tuya Lock Monitor v2.**
+5. Pick a mode:
+   - **Cloud** — needs your Tuya IoT Platform `access_id`, `access_secret`, `device_id`, and region endpoint.
+   - **Local** — needs the device's LAN IP, `local_key`, and protocol version (3.3 / 3.4 / 3.5).
 
-1. Open HACS in Home Assistant
-2. Go to **Integrations → ⋮ → Custom repositories**
-3. Add `https://github.com/crestall/ha-tuya-lock-monitor` as category **Integration**
-4. Search for **Tuya Lock Monitor** and install
-5. Restart Home Assistant
-
-### Manual
-
-1. Download or clone this repository
-2. Copy the `custom_components/tuya_lock_monitor` folder into your HA config directory:
-   ```
-   config/custom_components/tuya_lock_monitor/
-   ```
-3. Restart Home Assistant
-
----
-
-## Configuration
-
-1. Go to **Settings → Devices & Services → Add Integration**
-2. Search for **Tuya Lock Monitor**
-3. Choose your connection mode:
-
-**Local only:**
-
-| Field | Description |
-|---|---|
-| Device ID | Auto-filled if you use the network scan, otherwise from the Tuya app |
-| Local Key | The device's encryption key (see above) |
-| Lock LAN IP address | Auto-filled if you use the network scan, otherwise from the router DHCP table |
-| Protocol version | Auto-detected if scanned, usually `3.4` |
-
-> During local setup you'll be offered a **Scan network** option that broadcasts a UDP discovery packet and lists all Tuya devices found, with their IP and Device ID pre-filled.
-
-**Cloud:**
-
-| Field | Description |
-|---|---|
-| Access ID | Client ID from your Tuya IoT project |
-| Access Secret | Client Secret from your Tuya IoT project |
-| Device ID | The ID of your lock device |
-| API Endpoint | Select your region (EU / US / CN / IN) |
-| Lock LAN IP address | Optional — enables fast local polling |
-| Protocol version | Optional — only used if local IP is set |
-
-4. Click **Submit** — the integration will validate the connection and add the device
-
-### Updating settings after setup
-
-Go to **Settings → Devices & Services → Tuya Lock Monitor → Configure** to update the local IP, local key, or protocol version without re-entering your cloud credentials.
-
----
+You can add the same device in both modes if you want the reliability of local polling with cloud-only controls (like passage mode) as a backup.
 
 ## Entities
 
-Once configured, the following entities are created under your lock device:
+| Platform | Entity | Notes |
+| --- | --- | --- |
+| `lock` | Lock | Cloud mode uses Smart Lock door-operate (ticket + `open`). Local mode toggles the motor DP where the device accepts writes. |
+| `sensor` | Battery | `residual_electricity`. |
+| `sensor` | Last Fingerprint / Password / Card Unlock | State = resolved name; attributes expose `id`, `person_name`, `last_seen`. |
+| `sensor` | App / Temporary / Remote / BLE unlock counters | `TOTAL_INCREASING` state class where appropriate. |
+| `sensor` | Last Alarm | Mirrors `alarm_lock`. |
+| `sensor` | Last Contact | Timestamp of the last successful poll. Diagnostic. |
+| `binary_sensor` | Auto-lock Armed | Read-only reflection of `automatic_lock`. |
+| `switch` | Do Not Disturb | When the DP is present. |
+| `switch` | Passage Mode | DL026HA + cloud credentials only. See below. |
+| `select` | Beep Volume | `mute` / `normal`. |
+| `number` | Auto-lock Time | 1–1800 s slider. |
 
-### Sensors
+## The user YAML
 
-| Entity | Description |
-|---|---|
-| `sensor.battery` | Battery level (%) — raw value from device |
-| `sensor.last_fingerprint_unlock` | Code number of the fingerprint used (or name if assigned) |
-| `sensor.last_password_unlock` | Code number of the password used (or name if assigned) |
-| `sensor.last_card_unlock` | Code number of the card used (or name if assigned) |
-| `sensor.app_unlocks` | Cumulative app unlock count |
-| `sensor.temporary_code_unlocks` | Cumulative temporary code unlock count |
-| `sensor.pending_unlock_requests` | Number of pending unlock requests |
-| `sensor.last_alarm` | Most recent alarm event type |
+`<config>/tuya_lock_users.yaml`:
 
-### Binary Sensors
+```yaml
+fingerprint_names:
+  1: Pat
+  2: Alex
+  3: Guest
 
-| Entity | Description |
-|---|---|
-| `binary_sensor.doorbell` | On when doorbell is pressed — **automatically resets to Off after 1 second** |
-| `binary_sensor.deadbolt_reverse_lock` | On when deadbolt is engaged |
-| `binary_sensor.duress_hijack_alert` | On when a duress/hijack event is detected |
-| `binary_sensor.normally_open_mode` | On when lock is held in passage mode |
-| `binary_sensor.online` | Connectivity — on when lock is online |
+password_names:
+  1: Front door code
+  2: Cleaner pin
 
-### Lock
+card_names:
+  1: Blue key fob
+  2: Spare card
+```
 
-| Entity | Description |
-|---|---|
-| `lock.door_lock` | Controls passage mode (hold open / release) |
+IDs not listed fall through as the raw integer string. Reload any v2 entry (or restart HA) to pick up edits.
 
-> **Note:** The lock entity controls the `normal_open_switch` data point (passage/hold-open mode). This is not a remote unlock — it holds the lock open for hands-free access or closes it to normal latching mode.
+## Passage Mode
 
----
+DL026HA firmware treats `automatic_lock` as read-only — writing it causes phantom unlock events — so true passage mode isn't reachable over the API. The switch emulates it:
 
-## Credential Names
+- **On** → saves the current `auto_lock_time`, bumps it to 1800 s, unlocks the door, then re-issues an unlock every 1700 s.
+- **Off** → cancels the timer, restores the saved `auto_lock_time`, relocks.
 
-The lock returns a **code number** each time a fingerprint, password, or card is used to unlock — this is the ID of the stored credential, not a counter.
+Caveats: it's cloud-only (local mode can't call door-operate), and active passage mode adds roughly 50 extra API calls per day from the refresh loop. The switch is only offered on DL026HA-family entries with cloud credentials configured. - This isn't ideal, but I'm working on a better solution.
 
-You can assign a friendly name to each code so the sensor shows the person's name instead of a raw number.
+## Events
 
-### How to configure names
-
-1. Go to **Settings → Devices & Services → Tuya Lock Monitor → Configure**
-2. In the **Fingerprint code names**, **Password code names**, or **Card code names** fields, enter your mappings:
-
-   ```
-   1=Dad, 2=Mum, 3=Guest
-   ```
-
-   Separate entries with commas. Each entry is `<code>=<name>`.
-
-3. Click **Submit** — the sensor states update immediately.
-
-### Example
-
-If fingerprint code `2` belongs to "Mum":
-- Before: `sensor.last_fingerprint_unlock` = `2`
-- After:  `sensor.last_fingerprint_unlock` = `Mum`
-
-The raw code number is always available as the `code` attribute on the sensor, so automations can use either the name or the code:
+Every new unlock fires a Home Assistant bus event you can trigger on:
 
 ```yaml
 trigger:
-  - platform: state
-    entity_id: sensor.last_fingerprint_unlock
-condition:
-  - condition: template
-    value_template: "{{ trigger.to_state.attributes.code == 2 }}"
+  - platform: event
+    event_type: tuya_lock_monitor_v2_unlock
+    event_data:
+      kind: unlock_fingerprint
+      id: 1           # or omit to match any user
 ```
 
-> **Note:** Each unlock type (fingerprint, password, card) has its own independent set of codes. Code `1` for fingerprints may refer to a different person than code `1` for passwords.
+Payload fields: `entry_id`, `device_id`, `device_name`, `kind` (`unlock_fingerprint` / `unlock_password` / `unlock_card`), `id`, `time`.
 
----
+## Credits
 
-## API Endpoints by Region
-
-| Region | Endpoint |
-|---|---|
-| Europe | `https://openapi.tuyaeu.com` |
-| United States | `https://openapi.tuyaus.com` |
-| China | `https://openapi.tuyacn.com` |
-| India | `https://openapi.tuyain.com` |
-
-Choose the region that matches the **Data Centre** you selected when creating your Tuya IoT project.
-
----
-
-## Alarm Event Values
-
-The `last_alarm` sensor reports one of the following strings:
-
-| Value | Meaning |
-|---|---|
-| `wrong_finger` | Failed fingerprint attempt |
-| `wrong_password` | Failed password attempt |
-| `wrong_card` | Failed card attempt |
-| `wrong_face` | Failed face recognition |
-| `pry` | Pry/tamper detected |
-| `low_battery` | Battery critically low |
-| `power_off` | Power lost |
-| `shock` | Physical shock detected |
-| `key_in` | Key inserted |
-| `unclosed_time` | Door left open too long |
-| `tongue_bad` | Latch bolt problem |
-| `tongue_not_out` | Bolt not extended |
-| `defense` | Armed/defense mode triggered |
-
----
-
-## Troubleshooting
-
-**Lock stops responding in local-only mode**
-- The local key changes when the device is reset and re-paired. Go to **Configure** and enter the new key.
-- Check the IP hasn't changed — set a DHCP reservation in your router for the lock's MAC address to keep it stable.
-- Try a different protocol version (3.3, 3.4, 3.5).
-- Check HA logs for `[TuyaPing]` or `[TuyaLocal]` entries to see what the ping loop is doing.
-
-**"No permissions" error (cloud mode)**
-- Make sure your Tuya IoT project is subscribed to the **IoT Core** API service
-- Make sure your Smart Life app account is linked to the project via the **Link Tuya App Account** QR code
-
-**"Invalid Access ID or Secret" error (cloud mode)**
-- Double-check you are using the correct Access ID and Secret from your project's Overview tab
-- Make sure your chosen endpoint region matches your project's Data Centre region
-
-**Entities unavailable**
-- Check that the lock is online in the Smart Life app (cloud mode) or reachable on your network (local mode)
-- Check HA logs: **Settings → System → Logs** (filter by `tuya_lock_monitor`)
-
-**Enable debug logging** by adding to `configuration.yaml`:
-```yaml
-logger:
-  logs:
-    custom_components.tuya_lock_monitor: debug
-```
-
----
+- **[@crestall](https://github.com/crestall)** — original `ha-tuya-lock-monitor` integration, which this project is forked from. The dual-mode coordinator, DP mapping, and general shape of the integration are all his work.
+- The wider Home Assistant, [tinytuya](https://github.com/jasonacox/tinytuya), and [tuya-iotos-embeded-sdk](https://github.com/tuya/tuya-iotos-embeded-sdk-wifi-ble-bk7231n) communities for the protocol reverse-engineering this all leans on.
 
 ## License
 
-MIT License — see [LICENSE](LICENSE) for details.
+Inherits the license of the upstream `ha-tuya-lock-monitor` project.
