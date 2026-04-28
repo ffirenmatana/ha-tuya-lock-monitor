@@ -1,6 +1,6 @@
 # Tuya Lock Monitor for Home Assistant
 
-A Home Assistant custom integration for Tuya Smart Locks, with support for the **DL026HA** family when paired with an **SG120HA** BLE-to-Wi-Fi gateway. Works in either **cloud** mode (via the Tuya IoT Platform OpenAPI) or **local** mode (via `tinytuya`).
+A Home Assistant custom integration for Tuya Smart Locks, with first-class support for the **DL026HA** family when paired with an **SG120HA** BLE-to-Wi-Fi gateway. Works in either **cloud** mode (via the Tuya IoT Platform OpenAPI) or **local** mode (via `tinytuya`).
 
 This integration is a v2 rewrite of [**@crestall**'s original `ha-tuya-lock-monitor`](https://github.com/crestall/ha-tuya-lock-monitor). Huge thanks to crestall for the foundational work that made this possible — the DP mapping, the dual cloud/local coordinator design, and the config-flow UX all originate there.
 
@@ -9,7 +9,7 @@ This integration is a v2 rewrite of [**@crestall**'s original `ha-tuya-lock-moni
 - **Shared user-name YAML** — a single `tuya_lock_users.yaml` drives fingerprint / password / card name resolution across every lock entry. No more per-entry duplication.
 - **Last-user event tracking** — the raw DP pulses to an ID and back to `0` in a fraction of a second; v2 captures the last non-zero ID and exposes it as the sensor state plus `id` / `person_name` / `last_seen` attributes.
 - **`tuya_lock_monitor_v2_unlock` bus event** — fires on every new unlock with `{entry_id, device_id, device_name, kind, id, time}` for easy automations.
-- **Passage Mode switch** — emulates passage mode by maxing `auto_lock_time` and re-issuing the unlock on a timer (DL026HA firmware treats `automatic_lock` as read-only, so the "real" approach doesn't work).
+- **Passage Mode switch** — real passage mode (not emulated). Writes `automatic_lock=true` to put the lock into stay-unlocked mode, with a 30-minute hardware-level backstop in case HA crashes while it's on. Cloud-credentials only.
 - **Do Not Disturb switch** — toggles the DP of the same name when the device exposes it.
 - **Beep volume select** — `mute` / `normal`.
 - **Auto-lock time number** — slider for 1–1800 s.
@@ -75,12 +75,20 @@ IDs not listed fall through as the raw integer string. Reload any v2 entry (or r
 
 ## Passage Mode
 
-DL026HA firmware treats `automatic_lock` as read-only — writing it causes phantom unlock events — so true passage mode isn't reachable over the API. The switch emulates it:
+Real, server-side passage mode — no refresh loop, no extra API calls while held.
 
-- **On** → saves the current `auto_lock_time`, bumps it to 1800 s, unlocks the door, then re-issues an unlock every 1700 s.
-- **Off** → cancels the timer, restores the saved `auto_lock_time`, relocks.
+The DL026HA firmware exposes the `automatic_lock` DP as a writable Boolean function whose semantics are inverted relative to its name (verified empirically — the "phantom unlock" v1 saw was the DP doing exactly its job):
 
-Caveats: it's cloud-only (local mode can't call door-operate), and active passage mode adds roughly 50 extra API calls per day from the refresh loop. The switch is only offered on DL026HA-family entries with cloud credentials configured. - This isn't ideal, but I'm working on a better solution.
+- **On** → saves the current `auto_lock_time`, bumps it to 1800 s as a hardware-level safety backstop, then writes `automatic_lock=true`. The motor unlocks and stays unlocked indefinitely. Two API calls total.
+- **Off** → writes `automatic_lock=false` (the door relocks immediately), then restores the saved `auto_lock_time`. Two API calls total.
+
+Cloud credentials are required (the writable DP is only reachable via the IoT Platform), so the switch is only offered on DL026HA-family entries with a cloud config.
+
+### Crash-safety
+
+If HA shuts down cleanly (or the integration is unloaded / reconfigured) while passage mode is active, a shutdown hook writes `automatic_lock=false` so the door doesn't stay open.
+
+If HA dies hard before the shutdown hook runs, the 30-minute `auto_lock_time` cap set when entering passage mode acts as a hardware-level backstop: the lock physically re-engages within half an hour even if no software ever talks to it again. Worst-case unlocked exposure after a hard crash is therefore bounded.
 
 ## Events
 

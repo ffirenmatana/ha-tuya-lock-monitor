@@ -1,0 +1,11 @@
+{
+  "domain": "tuya_lock_monitor_v2",
+  "name": "Tuya Lock Monitor v2",
+  "version": "2.3.0",
+  "documentation": "https://github.com/crestall/ha-tuya-lock-monitor",
+  "requirements": ["tinytuya>=1.12.0"],
+  "dependencies": [],
+  "codeowners": [],
+  "iot_class": "cloud_polling",
+  "config_flow": true
+}

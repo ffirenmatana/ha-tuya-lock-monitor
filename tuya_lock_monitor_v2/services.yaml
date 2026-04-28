@@ -1,0 +1,91 @@
+dump_specifications:
+  name: Dump device specifications
+  description: >-
+    Fetch the full DP schema from /v1.0/devices/{id}/specifications and write
+    it to tuya_lock_v2_spec_<device_id>.json in the HA config directory. Also
+    logs every function and status DP at WARNING level. Use this to discover
+    passage-mode-like DPs (e.g. normal_open_switch) that the firmware
+    supports but hides from the regular /status payload. Read-only — does
+    not change device state.
+  fields:
+    entity_id:
+      name: Entity ID
+      description: Any entity belonging to the target lock (optional if only one lock is configured).
+      example: lock.tilly
+      selector:
+        entity:
+          integration: tuya_lock_monitor_v2
+    device_id:
+      name: Tuya device ID
+      description: The Tuya IoT Platform device id (optional if only one lock is configured).
+      example: bf609f808047af0b4co9ko
+      selector:
+        text:
+
+try_normal_open_switch:
+  name: Try normal_open_switch DP
+  description: >-
+    One-shot test. Sends normal_open_switch = <value> to the target lock.
+    On many Tuya lock firmwares this is the real passage-mode toggle; if
+    the device accepts the write (check the log for 'accepted' vs a cloud
+    error code like 501), passage mode is possible with zero refresh cost.
+    WARNING - may unlock the door. Make sure you are present when testing.
+  fields:
+    value:
+      name: Value
+      description: true to enable passage mode, false to disable.
+      required: true
+      example: true
+      selector:
+        boolean:
+    entity_id:
+      name: Entity ID
+      description: Any entity belonging to the target lock (optional if only one lock is configured).
+      example: lock.tilly
+      selector:
+        entity:
+          integration: tuya_lock_monitor_v2
+    device_id:
+      name: Tuya device ID
+      description: The Tuya IoT Platform device id (optional if only one lock is configured).
+      example: bf609f808047af0b4co9ko
+      selector:
+        text:
+
+try_dp_write:
+  name: Try writing any DP via cloud
+  description: >-
+    Generic probe - sends {"code": <code>, "value": <value>} to the Tuya
+    IoT Platform /commands endpoint, bypassing this integration's internal
+    read-only filter. Useful for testing DPs that the /specifications
+    endpoint claims are writable (e.g. automatic_lock). WARNING - may
+    change device state; only use when you know what the DP does.
+  fields:
+    code:
+      name: DP code
+      description: The DP code string (e.g. automatic_lock, auto_lock_time).
+      required: true
+      example: automatic_lock
+      selector:
+        text:
+    value:
+      name: Value
+      description: >-
+        The value to send. Accepts true/false, an integer, or a string.
+      required: true
+      example: "false"
+      selector:
+        text:
+    entity_id:
+      name: Entity ID
+      description: Any entity belonging to the target lock (optional if only one lock is configured).
+      example: lock.tilly
+      selector:
+        entity:
+          integration: tuya_lock_monitor_v2
+    device_id:
+      name: Tuya device ID
+      description: The Tuya IoT Platform device id (optional if only one lock is configured).
+      example: bf609f808047af0b4co9ko
+      selector:
+        text:

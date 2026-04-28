@@ -1,0 +1,24 @@
+# Tuya Lock Monitor v2 — shared user name mapping.
+#
+# Copy this file to <home-assistant-config>/tuya_lock_users.yaml and edit the
+# IDs to match your locks. Integer IDs must be the raw values reported in the
+# device `unlock_fingerprint` / `unlock_password` / `unlock_card` DPs.
+#
+# Every v2 lock entry reads the same file, so a fingerprint slot always
+# resolves to the same person across all locks — no per-lock duplication.
+#
+# Edits take effect after reloading any lock entry (or restarting Home
+# Assistant). IDs not listed here fall through as the raw integer string.
+
+fingerprint_names:
+  1: Pat
+  2: Alex
+  3: Guest
+
+password_names:
+  1: Front door code
+  2: Cleaner pin
+
+card_names:
+  1: Blue key fob
+  2: Spare card
