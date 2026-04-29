@@ -3,8 +3,10 @@
 DL026HA (BLE sub-device of SG120HA gateway):
     * Unlock → Smart Lock door-operate with open=true.
     * Lock   → Smart Lock door-operate with open=false.
-      (v1 wrote `automatic_lock=True`; that DP is read-only on this firmware
-      and writes caused a phantom unlock.)
+    * State is DERIVED, not read from lock_motor_state. The DP only tracks
+      the most-recent cloud-API door-operate command — Tuya-app unlocks,
+      fingerprint scans, and the auto-lock timer firing don't move it. We
+      compute is_locked from automatic_lock + recent-unlock window instead.
 
 DL031HA (fallback, kept for parity):
     * `normal_open_switch` toggle.
@@ -12,6 +14,7 @@ DL031HA (fallback, kept for parity):
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from typing import Any
 
 from homeassistant.components.lock import LockEntity
@@ -19,9 +22,12 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
+from homeassistant.util import dt as dt_util
 
 from .const import (
+    AUTO_LOCK_TIME_DEFAULT,
     DOMAIN,
+    STATUS_AUTO_LOCK_TIME,
     STATUS_AUTOMATIC_LOCK,
     STATUS_LOCK_MOTOR_STATE,
     STATUS_NORMAL_OPEN_SWITCH,
@@ -93,27 +99,45 @@ class TuyaSmartLockV2(CoordinatorEntity[TuyaLockCoordinator], LockEntity):
             return None
         status = self._status()
 
-        # DL026HA: lock_motor_state reports motor-engaged position. Despite
-        # the name, the firmware semantic is INVERTED:
-        #   * lock_motor_state = false  → motor at rest → door LOCKED
-        #   * lock_motor_state = true   → motor engaged/open → door UNLOCKED
-        # Verified against devices.txt (motor_state=false while doors were
-        # known-locked) and against passage-mode behaviour (motor_state=true
-        # while doors are held open).
+        # DL026HA family — derived state. lock_motor_state on this firmware
+        # only updates from cloud-API door-operate commands; it ignores
+        # Tuya-app unlocks, fingerprint scans, and the auto-lock timer
+        # firing. So we ignore it and compute state from things that DO
+        # update reliably:
+        #   1. automatic_lock = false  →  passage mode  →  Unlocked.
+        #   2. _last_unlock_at within auto_lock_time + grace  →  Unlocked.
+        #   3. otherwise  →  Locked.
+        if STATUS_AUTOMATIC_LOCK in status:
+            if status.get(STATUS_AUTOMATIC_LOCK) is False:
+                return False  # passage mode
+
+            last_unlock = self.coordinator.last_unlock_at
+            if last_unlock is not None:
+                try:
+                    auto_lock_time = int(
+                        status.get(STATUS_AUTO_LOCK_TIME, AUTO_LOCK_TIME_DEFAULT)
+                    )
+                except (TypeError, ValueError):
+                    auto_lock_time = AUTO_LOCK_TIME_DEFAULT
+                # Small grace window so the entity stays Unlocked through
+                # the firmware's own settling time before re-engaging.
+                window = timedelta(seconds=max(auto_lock_time, 1) + 5)
+                if dt_util.utcnow() - last_unlock < window:
+                    return False
+            return True
+
+        # DL031HA fallback: normal_open_switch True means "held open".
+        if STATUS_NORMAL_OPEN_SWITCH in status:
+            open_mode = status.get(STATUS_NORMAL_OPEN_SWITCH, False)
+            return not open_mode
+
+        # Last resort: motor_state with the inverted DL026HA convention.
         if STATUS_LOCK_MOTOR_STATE in status:
             motor = status.get(STATUS_LOCK_MOTOR_STATE)
             if motor is None:
                 return None
             return not bool(motor)
-
-        # DL026HA detected but motor state not yet seeded — report unknown
-        # rather than default to any state.
-        if STATUS_AUTOMATIC_LOCK in status:
-            return None
-
-        # DL031HA fallback: normal_open_switch True means "held open".
-        open_mode = status.get(STATUS_NORMAL_OPEN_SWITCH, False)
-        return not open_mode
+        return None
 
     # ---- commands -------------------------------------------------------
 

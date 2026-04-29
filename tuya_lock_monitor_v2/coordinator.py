@@ -103,6 +103,23 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # state-watch burst poll after door-operate.
         self._motor_state_seeded: bool = False
 
+        # Derived-state tracking. lock_motor_state on DL026HA only tracks
+        # the most-recent cloud-API door-operate command; it doesn't reflect
+        # actual door state for Tuya-app unlocks, fingerprint scans, or the
+        # auto-lock timer firing. We derive the lock entity's state from:
+        #   1. automatic_lock (false = passage mode = always unlocked)
+        #   2. _last_unlock_at within auto_lock_time + grace window
+        #   3. otherwise locked
+        # _last_unlock_at is set whenever we observe ANY unlock event:
+        # HA door-operate, fingerprint/password/card pulses, or any of the
+        # _UNLOCK_COUNTER_KEYS counters incrementing.
+        self._last_unlock_at: datetime | None = None
+        # Per-key snapshot of unlock counters; deltas indicate fresh events.
+        # Seeded on first observation so historical counts don't fire spurious
+        # events at startup.
+        self._unlock_counter_baseline: dict[str, int] = {}
+        self._unlock_counter_baseline_seeded: bool = False
+
         # Cloud state
         self._cached_meta: dict[str, Any] = {}
         self._last_meta_refresh: float = 0.0
@@ -135,6 +152,73 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     @property
     def passage_mode_active(self) -> bool:
         return self._passage_mode_active
+
+    @property
+    def last_unlock_at(self) -> datetime | None:
+        """Most recent observed unlock event from any source.
+
+        Sources: HA door-operate calls, fingerprint/password/card pulses,
+        and increments of the cloud-tracked unlock_* counters.
+        """
+        return self._last_unlock_at
+
+    # Counter DPs that increment monotonically on each unlock of that kind.
+    # Pulse-based unlocks (fingerprint/password/card) are handled separately
+    # via _last_user_event because those DPs reset to 0.
+    _UNLOCK_COUNTER_KEYS: tuple[str, ...] = (
+        "unlock_app",
+        "unlock_temporary",
+        "unlock_phone_remote",
+        "unlock_ble",
+    )
+
+    def _record_unlock_event(self, source: str) -> None:
+        """Mark 'now' as the last observed unlock event."""
+        self._last_unlock_at = dt_util.utcnow()
+        _LOGGER.info(
+            "[TuyaUnlock] Detected unlock from %s at %s",
+            source, self._last_unlock_at.isoformat(),
+        )
+
+    def _record_lock_event(self, source: str) -> None:
+        """Clear the recent-unlock state (deliberate lock action)."""
+        if self._last_unlock_at is not None:
+            _LOGGER.info(
+                "[TuyaUnlock] Cleared recent-unlock state from %s",
+                source,
+            )
+        self._last_unlock_at = None
+
+    def _detect_unlock_counter_events(self, status: dict[str, Any]) -> None:
+        """Compare incrementing unlock counters to baseline; fire on delta.
+
+        On the first observation of each counter we just record the value
+        without firing — historical counts shouldn't trigger spurious unlock
+        events when HA starts up.
+        """
+        any_seeded = False
+        for key in self._UNLOCK_COUNTER_KEYS:
+            raw = status.get(key)
+            if raw is None:
+                continue
+            try:
+                current = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if not self._unlock_counter_baseline_seeded:
+                self._unlock_counter_baseline[key] = current
+                any_seeded = True
+                continue
+            previous = self._unlock_counter_baseline.get(key)
+            if previous is None:
+                # First time we've seen this specific counter.
+                self._unlock_counter_baseline[key] = current
+                continue
+            if current > previous:
+                self._unlock_counter_baseline[key] = current
+                self._record_unlock_event(key)
+        if any_seeded and not self._unlock_counter_baseline_seeded:
+            self._unlock_counter_baseline_seeded = True
 
     def last_user_event(self, status_key: str) -> dict[str, Any] | None:
         """Return the most recently observed non-zero event for a user-ID DP.
@@ -586,6 +670,10 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if status.get("doorbell"):
             self._schedule_doorbell_reset()
 
+        # Track counter-based unlock events (Tuya app, BLE, temporary code).
+        # Fingerprint/password/card pulses are handled below via _last_user_event.
+        self._detect_unlock_counter_events(status)
+
         # Track last-seen user events so the sensor keeps displaying a name
         # even after the DP's momentary pulse returns to 0. Fire a bus event
         # only on a transition into a non-zero ID (not on repeated polls of
@@ -623,6 +711,7 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "time": dt_util.utcnow().isoformat(),
                 },
             )
+            self._record_unlock_event(key)
             self._schedule_unlock_reset(key)
 
         return {
@@ -688,41 +777,41 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         need_meta = not self._cached_meta or (now - self._last_meta_refresh) > CLOUD_META_REFRESH
 
         if self._local_ip:
-            if self._local_reachable and self.data:
-                if need_meta:
-                    try:
-                        async with aiohttp.ClientSession() as session:
-                            await self._refresh_cloud_meta(session)
-                    except Exception as err:  # noqa: BLE001
-                        _LOGGER.warning(
-                            "[TuyaLocal] Cloud meta refresh failed (using cache): %s",
-                            err,
-                        )
-                return self.data
-
-            _LOGGER.info("[TuyaCloud] Local unreachable — polling cloud as fallback")
+            # Cloud + local mode. We always poll cloud /status here — even
+            # when local is reachable — so externally-triggered events
+            # (Tuya app unlocks, fingerprint scans, the auto-lock timer
+            # firing) are reflected in HA. The local ping loop runs in
+            # parallel at sub-second cadence and is responsible for the
+            # local-only / push-only DPs (unlock_fingerprint pulses etc.).
             try:
                 async with aiohttp.ClientSession() as session:
-                    await self._refresh_cloud_meta(session)
+                    if need_meta:
+                        await self._refresh_cloud_meta(session)
                     token = await self._get_token(session)
                     cloud_status = await self._cloud_device_status(session, token)
                     await self._seed_missing_state(session, token, cloud_status)
-                if self.data:
-                    local_status = self.data.get("status", {})
-                    for k in self._LOCAL_ONLY_KEYS:
-                        if k in local_status:
-                            cloud_status[k] = local_status[k]
-                        else:
-                            cloud_status.pop(k, None)
-                return self._build_result(cloud_status, "cloud_fallback")
             except Exception as err:  # noqa: BLE001
                 if self.data:
                     _LOGGER.warning(
-                        "[TuyaCloud] Cloud fallback also failed — returning stale data: %s",
+                        "[TuyaCloud] Scheduled cloud poll failed — keeping stale data: %s",
                         err,
                     )
                     return self.data
-                raise UpdateFailed(f"Both local and cloud unavailable: {err}") from err
+                raise UpdateFailed(f"Cloud poll failed and no cached data: {err}") from err
+
+            # Layer local-only DPs on top of the cloud snapshot. These are
+            # values the cloud /status can't see (unlock pulses, doorbell)
+            # but the local ping loop has captured.
+            if self.data:
+                local_status = self.data.get("status", {})
+                for k in self._LOCAL_ONLY_KEYS:
+                    if k in local_status:
+                        cloud_status[k] = local_status[k]
+                    else:
+                        cloud_status.pop(k, None)
+
+            mode = "cloud+local" if self._local_reachable else "cloud_fallback"
+            return self._build_result(cloud_status, mode)
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -818,12 +907,21 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Optimistically reflect the commanded motor state. Note the
             # firmware's lock_motor_state semantic is inverted relative to
             # the DP name: true = motor in unlocked position, false = locked.
+            # On DL026HA the lock entity ignores motor_state and uses derived
+            # state instead; this update is preserved for non-DL026HA fallback.
             if self.data is not None and self.data.get("status") is not None:
                 new_status = {
                     **self.data["status"],
                     STATUS_LOCK_MOTOR_STATE: bool(open_lock),
                 }
                 self.async_set_updated_data({**self.data, "status": new_status})
+
+            # Record the action so the derived-state lock entity flips
+            # immediately rather than waiting for a status poll.
+            if open_lock:
+                self._record_unlock_event("ha_door_operate")
+            else:
+                self._record_lock_event("ha_door_operate")
 
             await self.async_watch_lock_state()
             return True
@@ -840,7 +938,64 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return await self.async_smart_lock_door_operate(open_lock=True)
 
     async def async_lock_door(self) -> bool:
-        return await self.async_smart_lock_door_operate(open_lock=False)
+        """Lock the door.
+
+        Uses the /commands endpoint with automatic_lock=true rather than
+        door-operate(open=false). Both physically lock the door, but only
+        automatic_lock=true keeps the cloud's lock_motor_state register in
+        sync with reality on DL026HA firmware. Door-operate(open=false)
+        leaves motor_state stuck at the previous value, which makes the
+        Tuya app and the device's state machine drift out of sync until
+        the user toggles passage mode in the app to force a realign. We
+        avoid that by using the firmware's native lock command directly.
+
+        Side effect: if passage mode is currently active, this also exits
+        it (the write is the same as async_exit_passage_mode's relock).
+        """
+        if not self._cloud_enabled:
+            _LOGGER.error(
+                "[SmartLock] Lock requires cloud credentials — the "
+                "/commands endpoint is cloud-only."
+            )
+            return False
+
+        ok = await self._cloud_send_command(
+            [{"code": STATUS_AUTOMATIC_LOCK, "value": True}]
+        )
+        if not ok:
+            _LOGGER.error("[SmartLock] async_lock_door: /commands rejected")
+            return False
+
+        # If the lock entity was used while passage mode was on, the same
+        # write also exited passage mode — keep our internal flag in sync.
+        if self._passage_mode_active:
+            _LOGGER.info(
+                "[SmartLock] Lock entity used during passage mode — "
+                "exiting passage mode to match"
+            )
+            self._passage_mode_active = False
+            if self._passage_saved_auto_lock is not None:
+                # Restore the user's auto_lock_time too so the timer is
+                # back to normal after this implicit passage-mode exit.
+                await self._cloud_send_command(
+                    [{"code": STATUS_AUTO_LOCK_TIME,
+                      "value": self._passage_saved_auto_lock}]
+                )
+                self._passage_saved_auto_lock = None
+
+        # Optimistically reflect the commanded motor state for any non-
+        # DL026HA fallback consumers; the DL026HA derived-state lock entity
+        # uses _record_lock_event below.
+        if self.data is not None and self.data.get("status") is not None:
+            new_status = {
+                **self.data["status"],
+                STATUS_LOCK_MOTOR_STATE: False,  # firmware: false = locked
+            }
+            self.async_set_updated_data({**self.data, "status": new_status})
+
+        self._record_lock_event("ha_lock_action")
+        await self.async_watch_lock_state()
+        return True
 
     # ------------------------------------------------------------------
     # State watch — burst-poll cloud status after a door-operate call
@@ -1124,6 +1279,9 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     "[PassageV2] automatic_lock=true write failed — "
                     "lock will still relock when auto_lock_time expires"
                 )
+            # Clear the recent-unlock state so the entity flips back to
+            # Locked rather than reporting Unlocked from a pre-passage event.
+            self._record_lock_event("passage_mode_exit")
 
         # Restore the user's previous auto_lock_time so normal behaviour
         # resumes (rather than leaving the 30-minute backstop in place).
