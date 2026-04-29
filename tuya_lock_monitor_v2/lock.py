@@ -93,12 +93,18 @@ class TuyaSmartLockV2(CoordinatorEntity[TuyaLockCoordinator], LockEntity):
             return None
         status = self._status()
 
-        # DL026HA: lock_motor_state is authoritative (True = locked).
+        # DL026HA: lock_motor_state reports motor-engaged position. Despite
+        # the name, the firmware semantic is INVERTED:
+        #   * lock_motor_state = false  → motor at rest → door LOCKED
+        #   * lock_motor_state = true   → motor engaged/open → door UNLOCKED
+        # Verified against devices.txt (motor_state=false while doors were
+        # known-locked) and against passage-mode behaviour (motor_state=true
+        # while doors are held open).
         if STATUS_LOCK_MOTOR_STATE in status:
             motor = status.get(STATUS_LOCK_MOTOR_STATE)
             if motor is None:
                 return None
-            return bool(motor)
+            return not bool(motor)
 
         # DL026HA detected but motor state not yet seeded — report unknown
         # rather than default to any state.

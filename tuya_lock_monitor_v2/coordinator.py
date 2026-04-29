@@ -34,6 +34,7 @@ from .const import (
     DOMAIN,
     DPS_TO_CODE,
     EVENT_UNLOCK,
+    AUTO_LOCK_TIME_DEFAULT,
     PASSAGE_MODE_MAX_AUTO_LOCK,
     PING_INTERVAL,
     SMART_LOCK_DOOR_OPERATE_PATH,
@@ -94,6 +95,13 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # we can restore it on exit (and so the 1800s safety cap is reverted).
         self._passage_mode_active: bool = False
         self._passage_saved_auto_lock: int | None = None
+
+        # First-refresh flag — we always query the device-logs endpoint on
+        # the first refresh after HA startup to seed lock_motor_state from
+        # the authoritative event stream rather than the (potentially stale)
+        # cloud /status cache. Subsequent refreshes rely on status + the
+        # state-watch burst poll after door-operate.
+        self._motor_state_seeded: bool = False
 
         # Cloud state
         self._cached_meta: dict[str, Any] = {}
@@ -390,26 +398,78 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         token: str,
         status: dict[str, Any],
     ) -> None:
-        """Seed lock_motor_state from device log when /status lacks it."""
-        if STATUS_LOCK_MOTOR_STATE in status:
-            return
+        """Reconcile lock_motor_state with the device-logs event stream.
+
+        For BLE sub-devices the cloud /status cache can lag indefinitely
+        (the lock only pushes changes through the gateway). The device-
+        logs endpoint is event-driven and authoritative. We unconditionally
+        query it once per HA startup and prefer its value, then fall back
+        to status for the rest of the session unless the field is missing.
+        """
         if STATUS_AUTOMATIC_LOCK not in status:
-            return  # not a DL026HA family device
+            if not self._motor_state_seeded:
+                _LOGGER.info(
+                    "[TuyaSeed] Skipped: automatic_lock not in /status, "
+                    "treating as non-DL026HA family device"
+                )
+                self._motor_state_seeded = True
+            return
+
+        # After the first refresh, only run the log query if status is
+        # actually missing the field (the original v1 behaviour).
+        if self._motor_state_seeded and STATUS_LOCK_MOTOR_STATE in status:
+            return
+
+        first_run = not self._motor_state_seeded
+        if first_run:
+            _LOGGER.info(
+                "[TuyaSeed] First refresh — querying device logs to verify "
+                "lock_motor_state (cloud /status reported %s)",
+                status.get(STATUS_LOCK_MOTOR_STATE, "<missing>"),
+            )
+
         try:
             logs = await self._cloud_device_logs(
                 session, token, STATUS_LOCK_MOTOR_STATE, size=1
             )
         except Exception as err:  # noqa: BLE001
-            _LOGGER.debug("[TuyaSeed] logs query failed: %s", err)
+            _LOGGER.warning(
+                "[TuyaSeed] device-logs query failed (status value retained): %s",
+                err,
+            )
+            self._motor_state_seeded = True
             return
+
+        self._motor_state_seeded = True
+
         if not logs:
+            _LOGGER.info(
+                "[TuyaSeed] device-logs returned no lock_motor_state events "
+                "in the last 30 days — keeping /status value %s",
+                status.get(STATUS_LOCK_MOTOR_STATE, "<missing>"),
+            )
             return
         value = self._coerce_log_value(logs[0].get("value"))
+        previous = status.get(STATUS_LOCK_MOTOR_STATE)
         status[STATUS_LOCK_MOTOR_STATE] = value
-        _LOGGER.info(
-            "[TuyaSeed] Seeded lock_motor_state=%s from logs event at %s",
-            value, logs[0].get("event_time"),
-        )
+        if previous is None:
+            _LOGGER.info(
+                "[TuyaSeed] Seeded lock_motor_state=%s from logs event at %s",
+                value, logs[0].get("event_time"),
+            )
+        elif previous != value:
+            _LOGGER.warning(
+                "[TuyaSeed] lock_motor_state corrected from stale /status "
+                "value %s → %s (logs event_time=%s). The /status cache lags "
+                "for BLE sub-devices; logs are authoritative.",
+                previous, value, logs[0].get("event_time"),
+            )
+        else:
+            _LOGGER.info(
+                "[TuyaSeed] lock_motor_state=%s confirmed by latest logs "
+                "event at %s",
+                value, logs[0].get("event_time"),
+            )
 
     # ------------------------------------------------------------------
     # Local LAN calls (tinytuya)
@@ -478,6 +538,16 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         "unlock_fingerprint",
         "unlock_password",
         "unlock_card",
+    })
+
+    # Keys where the cloud (especially the device-logs endpoint) is the
+    # authoritative source. For BLE sub-devices behind an SG120HA gateway,
+    # tinytuya's view of these is the gateway's cached value, which can lag
+    # the actual lock indefinitely. When cloud is enabled we strip these
+    # from local status before merging so the cloud-corrected value
+    # persists across the ping loop.
+    _CLOUD_AUTHORITATIVE_KEYS: frozenset[str] = frozenset({
+        STATUS_LOCK_MOTOR_STATE,
     })
 
     def _schedule_doorbell_reset(self) -> None:
@@ -565,6 +635,14 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         }
 
     def _merge_local_status(self, new_status: dict[str, Any]) -> dict[str, Any]:
+        # When cloud is enabled, the cloud is the source of truth for some
+        # keys (lock_motor_state for BLE sub-devices). Drop them from the
+        # local payload so the merge doesn't clobber the cloud value.
+        if self._cloud_enabled:
+            new_status = {
+                k: v for k, v in new_status.items()
+                if k not in self._CLOUD_AUTHORITATIVE_KEYS
+            }
         if self.data and "status" in self.data:
             merged = dict(self.data["status"])
             merged.update(new_status)
@@ -737,11 +815,13 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 )
                 return False
 
-            # Optimistically reflect the commanded motor state.
+            # Optimistically reflect the commanded motor state. Note the
+            # firmware's lock_motor_state semantic is inverted relative to
+            # the DP name: true = motor in unlocked position, false = locked.
             if self.data is not None and self.data.get("status") is not None:
                 new_status = {
                     **self.data["status"],
-                    STATUS_LOCK_MOTOR_STATE: not bool(open_lock),
+                    STATUS_LOCK_MOTOR_STATE: bool(open_lock),
                 }
                 self.async_set_updated_data({**self.data, "status": new_status})
 
@@ -781,10 +861,11 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return
 
         async def _watch() -> None:
+            # Firmware semantic: motor_state True = unlocked, False = locked.
             last_state: Any = None
             if self.data:
                 last_state = self.data.get("status", {}).get(STATUS_LOCK_MOTOR_STATE)
-            saw_unlocked = last_state is False
+            saw_unlocked = last_state is True
             try:
                 async with aiohttp.ClientSession() as session:
                     while time.time() < self._state_watch_until:
@@ -804,9 +885,9 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                                 )
 
                             current = cloud_status.get(STATUS_LOCK_MOTOR_STATE)
-                            if current is False:
+                            if current is True:
                                 saw_unlocked = True
-                            if saw_unlocked and current is True:
+                            if saw_unlocked and current is False:
                                 return
                         except Exception as err:  # noqa: BLE001
                             _LOGGER.debug("[TuyaWatch] Poll error: %s", err)
@@ -928,14 +1009,17 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # Passage mode (real, via automatic_lock DP)
     # ------------------------------------------------------------------
     # The DL026HA firmware exposes `automatic_lock` as a writable Boolean
-    # function whose actual semantics are inverted from its name:
+    # function with the obvious semantics — "should the lock auto-lock?":
     #
-    #   * automatic_lock = true   → motor unlocks and stays unlocked
-    #                              (no auto-relock fires). True passage mode.
-    #   * automatic_lock = false  → motor relocks immediately and auto-lock
-    #                              behaviour resumes.
+    #   * automatic_lock = false  → auto-lock OFF → passage mode ON,
+    #                              motor unlocks and stays unlocked.
+    #   * automatic_lock = true   → auto-lock ON → normal mode,
+    #                              motor relocks immediately and the
+    #                              auto-lock-time countdown resumes.
     #
-    # This was verified empirically with the v2.2.1 try_dp_write probe.
+    # (v2.3.0 had this inverted — the diagnostic probe's earlier reading
+    # was wrong. Verified by cross-checking the Tuya app's passage-mode
+    # toggle, which faithfully reflects the DP value.)
     #
     # We still bump auto_lock_time to its max (1800 s) when entering passage
     # mode so that, if HA crashes or the integration is unloaded uncleanly
@@ -943,7 +1027,7 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # half an hour rather than stay open indefinitely.
 
     async def async_enter_passage_mode(self) -> bool:
-        """Open the door and hold it open via automatic_lock=true.
+        """Open the door and hold it open via automatic_lock=false.
 
         Returns True on success, False if the firmware rejected the write.
         """
@@ -957,31 +1041,50 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return False
 
         # Capture the current auto_lock_time so we can restore it on exit.
+        # If it's already at the max, that almost certainly means a previous
+        # passage-mode run never restored it (HA crashed, or restart while
+        # passage was on). Fall back to AUTO_LOCK_TIME_DEFAULT in that case
+        # so we don't lock the user into permanently-1800 after toggling.
         current_status = (self.data or {}).get("status", {}) or {}
         saved_raw = current_status.get(STATUS_AUTO_LOCK_TIME)
         try:
-            self._passage_saved_auto_lock = int(saved_raw) if saved_raw is not None else None
+            saved_int = int(saved_raw) if saved_raw is not None else None
         except (TypeError, ValueError):
-            self._passage_saved_auto_lock = None
+            saved_int = None
+        if saved_int == PASSAGE_MODE_MAX_AUTO_LOCK:
+            _LOGGER.warning(
+                "[PassageV2] auto_lock_time was already %d s — assuming a "
+                "previous passage-mode run never restored it. Will restore "
+                "to %d s on exit instead.",
+                saved_int, AUTO_LOCK_TIME_DEFAULT,
+            )
+            self._passage_saved_auto_lock = AUTO_LOCK_TIME_DEFAULT
+        else:
+            self._passage_saved_auto_lock = saved_int
 
         # Bump auto_lock_time to the maximum as a hardware-level backstop.
         # If HA crashes mid-passage-mode, the lock will at least re-engage
         # after this timer fires rather than stay open indefinitely.
-        await self.async_send_command(
+        # Passage-mode writes go straight to /commands rather than through
+        # async_send_command — for BLE sub-devices the local tinytuya path
+        # silently swallows these writes (the gateway accepts them but
+        # doesn't propagate to the lock), which produced the "switch toggles
+        # but nothing happens" symptom in v2.3.0.
+        await self._cloud_send_command(
             [{"code": STATUS_AUTO_LOCK_TIME, "value": PASSAGE_MODE_MAX_AUTO_LOCK}]
         )
 
         # The actual passage-mode toggle.
-        ok = await self.async_send_command(
-            [{"code": STATUS_AUTOMATIC_LOCK, "value": True}]
+        ok = await self._cloud_send_command(
+            [{"code": STATUS_AUTOMATIC_LOCK, "value": False}]
         )
         if not ok:
             _LOGGER.error(
-                "[PassageV2] Firmware rejected automatic_lock=true — "
+                "[PassageV2] Firmware rejected automatic_lock=false — "
                 "aborting and restoring auto_lock_time"
             )
             if self._passage_saved_auto_lock is not None:
-                await self.async_send_command(
+                await self._cloud_send_command(
                     [{"code": STATUS_AUTO_LOCK_TIME, "value": self._passage_saved_auto_lock}]
                 )
             self._passage_saved_auto_lock = None
@@ -1013,19 +1116,19 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._passage_mode_active = False
 
         if relock:
-            ok = await self.async_send_command(
-                [{"code": STATUS_AUTOMATIC_LOCK, "value": False}]
+            ok = await self._cloud_send_command(
+                [{"code": STATUS_AUTOMATIC_LOCK, "value": True}]
             )
             if not ok:
                 _LOGGER.warning(
-                    "[PassageV2] automatic_lock=false write failed — "
+                    "[PassageV2] automatic_lock=true write failed — "
                     "lock will still relock when auto_lock_time expires"
                 )
 
         # Restore the user's previous auto_lock_time so normal behaviour
         # resumes (rather than leaving the 30-minute backstop in place).
         if self._passage_saved_auto_lock is not None:
-            await self.async_send_command(
+            await self._cloud_send_command(
                 [{"code": STATUS_AUTO_LOCK_TIME, "value": self._passage_saved_auto_lock}]
             )
             self._passage_saved_auto_lock = None
@@ -1049,8 +1152,8 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not self._cloud_enabled:
             return
         try:
-            await self.async_send_command(
-                [{"code": STATUS_AUTOMATIC_LOCK, "value": False}]
+            await self._cloud_send_command(
+                [{"code": STATUS_AUTOMATIC_LOCK, "value": True}]
             )
             _LOGGER.warning(
                 "[PassageV2] Shutdown: relocked door (passage mode was active)"

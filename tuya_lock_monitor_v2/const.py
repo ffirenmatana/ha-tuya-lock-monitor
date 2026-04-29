@@ -6,10 +6,10 @@ V2 changes vs v1:
     User names are now loaded from a single shared YAML file
     (`<config>/tuya_lock_users.yaml` by default) which every DL026HA-family
     entry consumes. Missing IDs pass through as-is; missing file is a warning.
-  * Passage mode is real, not emulated: writing `automatic_lock=true` puts
-    the lock into stay-unlocked mode (verified empirically on DL026HA
-    firmware via the v2.2 try_dp_write probe). The DP name is misleading;
-    its actual semantics are inverted relative to the obvious reading.
+  * Passage mode is real, not emulated: writing `automatic_lock=false`
+    disables the auto-lock timer and the door stays unlocked (verified
+    against the Tuya app's passage-mode toggle). Writing true re-enables
+    auto-lock and relocks immediately.
   * `automatic_lock` is therefore writable (was wrongly listed as read-only
     in v1; the "phantom unlock" v1 saw was the DP doing exactly its job).
   * New control surfaces:
@@ -100,8 +100,8 @@ STATUS_DOORBELL = "doorbell"
 STATUS_NORMAL_OPEN_SWITCH = "normal_open_switch"
 
 # DL026HA status codes (BLE sub-device of SG120HA gateway).
-STATUS_LOCK_MOTOR_STATE = "lock_motor_state"        # bool — true=locked, false=unlocked
-STATUS_AUTOMATIC_LOCK = "automatic_lock"            # bool — READ-ONLY: auto-lock timer armed
+STATUS_LOCK_MOTOR_STATE = "lock_motor_state"        # bool — true=UNLOCKED, false=LOCKED (firmware reports motor-engaged state, inverted from name)
+STATUS_AUTOMATIC_LOCK = "automatic_lock"            # bool — writable: true=auto-lock on, false=passage mode
 STATUS_UNLOCK_BLE = "unlock_ble"                    # int counter — BLE unlock events
 STATUS_UNLOCK_PHONE_REMOTE = "unlock_phone_remote"  # int counter — remote app unlocks
 
