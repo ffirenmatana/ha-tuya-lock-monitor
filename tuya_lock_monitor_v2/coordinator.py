@@ -783,6 +783,8 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # firing) are reflected in HA. The local ping loop runs in
             # parallel at sub-second cadence and is responsible for the
             # local-only / push-only DPs (unlock_fingerprint pulses etc.).
+            cloud_status: dict[str, Any] | None = None
+            cloud_err: Exception | None = None
             try:
                 async with aiohttp.ClientSession() as session:
                     if need_meta:
@@ -791,27 +793,55 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     cloud_status = await self._cloud_device_status(session, token)
                     await self._seed_missing_state(session, token, cloud_status)
             except Exception as err:  # noqa: BLE001
+                cloud_err = err
+
+            if cloud_status is not None:
+                # Layer local-only DPs on top of the cloud snapshot.
                 if self.data:
-                    _LOGGER.warning(
-                        "[TuyaCloud] Scheduled cloud poll failed — keeping stale data: %s",
-                        err,
-                    )
-                    return self.data
-                raise UpdateFailed(f"Cloud poll failed and no cached data: {err}") from err
+                    local_status = self.data.get("status", {})
+                    for k in self._LOCAL_ONLY_KEYS:
+                        if k in local_status:
+                            cloud_status[k] = local_status[k]
+                        else:
+                            cloud_status.pop(k, None)
+                mode = "cloud+local" if self._local_reachable else "cloud_fallback"
+                return self._build_result(cloud_status, mode)
 
-            # Layer local-only DPs on top of the cloud snapshot. These are
-            # values the cloud /status can't see (unlock pulses, doorbell)
-            # but the local ping loop has captured.
+            # Cloud failed. Three fallback strategies, in order:
+            #   1. We have cached data — keep using it, just log the failure.
+            #   2. Local is reachable — do a fresh local poll and run in
+            #      local-only-degraded mode (no passage mode, no door-operate,
+            #      no external-event detection, but the device is usable).
+            #   3. Neither — raise UpdateFailed so HA shows the error.
             if self.data:
-                local_status = self.data.get("status", {})
-                for k in self._LOCAL_ONLY_KEYS:
-                    if k in local_status:
-                        cloud_status[k] = local_status[k]
-                    else:
-                        cloud_status.pop(k, None)
+                _LOGGER.warning(
+                    "[TuyaCloud] Scheduled cloud poll failed — keeping stale data: %s",
+                    cloud_err,
+                )
+                return self.data
 
-            mode = "cloud+local" if self._local_reachable else "cloud_fallback"
-            return self._build_result(cloud_status, mode)
+            if self._local_reachable or self._local_key:
+                _LOGGER.warning(
+                    "[TuyaCloud] First-refresh cloud poll failed (%s) — "
+                    "falling back to local-only mode. Cloud-dependent "
+                    "features (passage mode, remote unlock/lock) will be "
+                    "unavailable until cloud is restored.",
+                    cloud_err,
+                )
+                try:
+                    status = await self._local_get_status()
+                    self._last_local_poll = now
+                    self._last_contact = dt_util.utcnow()
+                    return self._build_result(status, "local_degraded")
+                except Exception as local_err:  # noqa: BLE001
+                    raise UpdateFailed(
+                        f"Cloud failed ({cloud_err}); local fallback also "
+                        f"failed ({local_err})"
+                    ) from local_err
+
+            raise UpdateFailed(
+                f"Cloud poll failed and no cached data: {cloud_err}"
+            ) from cloud_err
 
         try:
             async with aiohttp.ClientSession() as session:
