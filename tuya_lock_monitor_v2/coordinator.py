@@ -1,13 +1,14 @@
 """Tuya Lock Monitor v2 coordinator.
 
 Differences from v1:
-  * Never writes the `automatic_lock` DP — that is a read-only status
-    ("auto-lock timer armed") on DL026HA firmware, and writing caused a
-    phantom unlock. Use `async_smart_lock_door_operate(open_lock=False)`
-    to relock instead.
+  * Real passage mode via the writable `automatic_lock` DP:
+    false → auto-lock off → door stays unlocked (passage mode),
+    true → auto-lock on → door relocks immediately. See the passage-mode
+    section below for the mechanics and the 30-minute safety backstop.
   * Exposes `async_lock_door()` / `async_unlock_door()` helpers so the lock
     entity never has to reason about which API to hit.
-  * No passage-mode logic (deferred — unreliable on BLE locks).
+  * Derived lock state (recent-unlock window) instead of trusting
+    `lock_motor_state`, which only tracks cloud door-operate commands.
   * Domain constant bumped so v1 and v2 can coexist.
 """
 from __future__ import annotations
@@ -23,7 +24,9 @@ from datetime import datetime, timedelta
 from typing import Any
 
 import aiohttp
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.event import async_call_later
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 from homeassistant.util import dt as dt_util
@@ -63,7 +66,10 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         local_ip: str | None = None,
         local_version: str = "3.4",
         local_key_direct: str | None = None,
+        entry_id: str | None = None,
+        config_entry: ConfigEntry | None = None,
     ) -> None:
+        self._entry_id = entry_id
         self._access_id = access_id
         self._access_secret = access_secret
         self._device_id = device_id
@@ -79,22 +85,51 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._ping_task: asyncio.Task | None = None
         self._last_contact: datetime | None = None
 
+        # Persistent tinytuya Device, reused across polls instead of a new
+        # TCP connection per poll. Guarded by _local_lock (tinytuya isn't
+        # thread-safe and status polls / command sends can overlap).
+        self._local_device: Any | None = None
+        self._local_lock: asyncio.Lock = asyncio.Lock()
+
         # Burst-poll state (used after smart-lock door-operate).
         self._state_watch_task: asyncio.Task | None = None
         self._state_watch_until: float = 0.0
+        self._watch_motor: bool = False
 
         # Auto-reset handles for edge-triggered DPs.
         self._doorbell_reset_unsub: object | None = None
         self._unlock_reset_unsubs: dict[str, object] = {}
+        self._relock_refresh_unsub: object | None = None
 
         # Last-seen user event per unlock kind (survives the DP's auto-zero).
         # Maps status_key → {"id": int, "time": datetime}.
         self._last_user_event: dict[str, dict[str, Any]] = {}
 
-        # Passage-mode state. We still capture the previous auto_lock_time so
-        # we can restore it on exit (and so the 1800s safety cap is reverted).
-        self._passage_mode_active: bool = False
+        # Passage-mode state. Whether passage mode is active is NOT tracked
+        # here — it is read from the lock's own `automatic_lock` DP (see
+        # passage_mode_active), so it survives HA restarts and reflects
+        # changes made in the Tuya app. We only keep the previous
+        # auto_lock_time so it can be restored on exit (reverting the 1800 s
+        # safety cap).
         self._passage_saved_auto_lock: int | None = None
+
+        # Serialises multi-step command sequences (enter/exit passage mode,
+        # lock, unlock) so two callers can't interleave writes to one lock.
+        self._cmd_lock: asyncio.Lock = asyncio.Lock()
+
+        # DP writes the cloud has accepted but the lock hasn't reported back
+        # yet. Maps status code → (commanded value, monotonic deadline).
+        # "success" from the cloud only means the command was queued for the
+        # gateway; a BLE lock applies it seconds later (or never). Until the
+        # lock confirms, the commanded value is overlaid on polled status so
+        # the UI doesn't bounce; if the deadline passes unconfirmed we log it
+        # and let the lock's reported value win. See _apply_expectations.
+        self._expected: dict[str, tuple[Any, float]] = {}
+
+        # Set when cloud metadata shows this device is a gateway sub-device
+        # (e.g. a BLE lock behind an SG120HA). Local polling is refused for
+        # those — see _refresh_cloud_meta.
+        self._is_sub_device: bool = False
 
         # First-refresh flag — we always query the device-logs endpoint on
         # the first refresh after HA startup to seed lock_motor_state from
@@ -126,9 +161,13 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._token: str | None = None
         self._token_expire: float = 0.0
 
+        # Passed explicitly (None during config-flow validation) rather than
+        # left to HA's ContextVar lookup: with an entry, HA calls
+        # async_shutdown on unload for us.
         super().__init__(
             hass,
             _LOGGER,
+            config_entry=config_entry,
             name=DOMAIN,
             update_interval=timedelta(seconds=UPDATE_INTERVAL),
         )
@@ -151,7 +190,23 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     @property
     def passage_mode_active(self) -> bool:
-        return self._passage_mode_active
+        """True when the lock itself reports auto-lock disabled.
+
+        Read from the `automatic_lock` DP (with any pending commanded value
+        overlaid) rather than an in-memory flag: a flag is lost on restart,
+        after which turn_off used to no-op while the door stayed open.
+        """
+        status = (self.data or {}).get("status") or {}
+        return status.get(STATUS_AUTOMATIC_LOCK) is False
+
+    @property
+    def is_sub_device(self) -> bool:
+        return self._is_sub_device
+
+    @property
+    def local_polling_enabled(self) -> bool:
+        """Whether the tinytuya ping loop should run for this entry."""
+        return bool(self._local_ip) and not self._is_sub_device
 
     @property
     def last_unlock_at(self) -> datetime | None:
@@ -172,6 +227,92 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         "unlock_ble",
     )
 
+    def _dispatch_updated_data(self, data: dict[str, Any]) -> None:
+        """async_set_updated_data, safe to call from any thread.
+
+        Listener notification must happen on the event loop; if a code path
+        ends up here from an executor thread, marshal the call across.
+        """
+        try:
+            on_loop = asyncio.get_running_loop() is self.hass.loop
+        except RuntimeError:
+            on_loop = False
+        if on_loop:
+            self.async_set_updated_data(data)
+        else:
+            self.hass.loop.call_soon_threadsafe(self.async_set_updated_data, data)
+
+    @callback
+    def _publish_local_data(self, data: dict[str, Any]) -> None:
+        """Push ping-loop data to listeners WITHOUT touching the poll timer.
+
+        async_set_updated_data() cancels the scheduled refresh (and any
+        debounced async_request_refresh) and re-arms it a full
+        update_interval away. Called from a 1 Hz loop that means the cloud
+        poll never fires at all: cloud-sourced DPs froze at whatever the
+        last command's immediate refresh returned. So the ping loop sets the
+        data itself, and only wakes listeners when something changed.
+        """
+        if data == self.data:
+            return
+        self.data = data
+        self.last_update_success = True
+        self.async_update_listeners()
+
+    # ------------------------------------------------------------------
+    # Command confirmation
+    # ------------------------------------------------------------------
+
+    # How long the lock gets to report a commanded DP back before we call
+    # the write lost. BLE locks behind a gateway typically confirm in 3-15 s.
+    _CONFIRM_TIMEOUT: float = 45.0
+
+    def _expect(self, code: str, value: Any) -> None:
+        """Note that `code` should read `value` once the lock applies it."""
+        self._expected[code] = (value, time.monotonic() + self._CONFIRM_TIMEOUT)
+
+    def _apply_expectations(
+        self, status: dict[str, Any], fresh: dict[str, Any] | None = None
+    ) -> None:
+        """Overlay commanded-but-unconfirmed DP values onto polled status.
+
+        `fresh` is what was JUST read from the lock's side (defaults to
+        `status`). Only that may confirm an expectation: `status` is often
+        built on top of self.data, which already carries our own overlay,
+        and an overlay must never confirm itself.
+        """
+        if fresh is None:
+            fresh = status
+        now = time.monotonic()
+        for code, (value, deadline) in list(self._expected.items()):
+            actual = fresh.get(code)
+            if code in fresh and actual == value:
+                del self._expected[code]
+                _LOGGER.debug("[Confirm] %s=%s confirmed by the lock", code, value)
+            elif now >= deadline:
+                del self._expected[code]
+                _LOGGER.warning(
+                    "[Confirm] %s=%s was accepted by the Tuya cloud but the "
+                    "lock still reports %s after %.0f s — the command "
+                    "probably never reached it over Bluetooth",
+                    code, value, actual, self._CONFIRM_TIMEOUT,
+                )
+                if code in fresh:
+                    status[code] = actual
+            else:
+                status[code] = value
+
+    def _push_expected(self) -> None:
+        """Reflect freshly-commanded values in entity state right away."""
+        if self.data is None or self.data.get("status") is None:
+            return
+        # Overlay only — nothing here was read from the lock, so nothing
+        # here can confirm (or expire) an expectation.
+        status = dict(self.data["status"])
+        for code, (value, _deadline) in self._expected.items():
+            status[code] = value
+        self._dispatch_updated_data({**self.data, "status": status})
+
     def _record_unlock_event(self, source: str) -> None:
         """Mark 'now' as the last observed unlock event."""
         self._last_unlock_at = dt_util.utcnow()
@@ -179,6 +320,8 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "[TuyaUnlock] Detected unlock from %s at %s",
             source, self._last_unlock_at.isoformat(),
         )
+        self._schedule_relock_refresh()
+        self.async_update_listeners()
 
     def _record_lock_event(self, source: str) -> None:
         """Clear the recent-unlock state (deliberate lock action)."""
@@ -188,6 +331,36 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 source,
             )
         self._last_unlock_at = None
+        self._cancel_relock_refresh()
+        self.async_update_listeners()
+
+    # The lock entity shows Unlocked for auto_lock_time + 5 s after
+    # _last_unlock_at. That is derived from the clock, not from data, so
+    # nothing tells HA when the window closes — and the next poll may be
+    # minutes away. Re-render entities ourselves just after it does.
+    _RELOCK_WINDOW_GRACE: int = 6
+
+    def _schedule_relock_refresh(self) -> None:
+        self._cancel_relock_refresh()
+        status = (self.data or {}).get("status") or {}
+        try:
+            secs = int(status.get(STATUS_AUTO_LOCK_TIME, AUTO_LOCK_TIME_DEFAULT))
+        except (TypeError, ValueError):
+            secs = AUTO_LOCK_TIME_DEFAULT
+        self._relock_refresh_unsub = async_call_later(
+            self.hass, max(secs, 1) + self._RELOCK_WINDOW_GRACE,
+            self._async_relock_refresh,
+        )
+
+    def _cancel_relock_refresh(self) -> None:
+        if self._relock_refresh_unsub is not None:
+            self._relock_refresh_unsub()  # type: ignore[operator]
+            self._relock_refresh_unsub = None
+
+    @callback
+    def _async_relock_refresh(self, _now: object = None) -> None:
+        self._relock_refresh_unsub = None
+        self.async_update_listeners()
 
     def _detect_unlock_counter_events(self, status: dict[str, Any]) -> None:
         """Compare incrementing unlock counters to baseline; fire on delta.
@@ -232,7 +405,10 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def async_start_ping_loop(self) -> None:
         if self._ping_task and not self._ping_task.done():
             return
-        self._ping_task = self.hass.async_create_task(
+        # A background task: a plain async_create_task made HA bootstrap
+        # ("Setup timed out for bootstrap waiting on tuya_lock_v2_ping") and
+        # shutdown wait minutes for a loop that never returns.
+        self._ping_task = self.hass.async_create_background_task(
             self._ping_loop(), name="tuya_lock_v2_ping"
         )
         _LOGGER.debug("[TuyaPing] Ping loop started for %s", self._local_ip)
@@ -244,6 +420,15 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if self._state_watch_task and not self._state_watch_task.done():
             self._state_watch_task.cancel()
             _LOGGER.debug("[TuyaWatch] State watch cancelled")
+        # Pending 1 s auto-resets of edge-triggered DPs.
+        if self._doorbell_reset_unsub is not None:
+            self._doorbell_reset_unsub()  # type: ignore[operator]
+            self._doorbell_reset_unsub = None
+        for unsub in self._unlock_reset_unsubs.values():
+            unsub()  # type: ignore[operator]
+        self._unlock_reset_unsubs.clear()
+        self._cancel_relock_refresh()
+        self._drop_local_device()
 
     async def _ping_loop(self) -> None:
         while True:
@@ -271,16 +456,17 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     result = self._build_result(
                         merged,
                         "local" if self._cloud_enabled else "local_only",
+                        fresh=status,
                     )
                     self._last_contact = dt_util.utcnow()
-                    self.async_set_updated_data(result)
-                    _LOGGER.debug("[TuyaPing] Local poll OK — pushed to listeners")
+                    self._publish_local_data(result)
+                    _LOGGER.debug("[TuyaPing] Local poll OK")
                 except asyncio.CancelledError:
                     return
                 except Exception as err:  # noqa: BLE001
                     _LOGGER.warning("[TuyaPing] Reachable but push failed: %s", err)
 
-            await asyncio.sleep(0.2 if reachable else 0.8)
+            await asyncio.sleep(PING_INTERVAL)
 
     # ------------------------------------------------------------------
     # Signing helpers
@@ -360,6 +546,14 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             await self._fetch_token(session)
         return self._token  # type: ignore[return-value]
 
+    def _forget_token_if_rejected(self, data: dict[str, Any]) -> None:
+        """Drop the cached token when the cloud says it's invalid/expired.
+
+        Otherwise every call keeps failing until our own 2-hour expiry.
+        """
+        if data.get("code") in self._TOKEN_ERROR_CODES:
+            self._token = None
+
     # ------------------------------------------------------------------
     # Cloud API calls
     # ------------------------------------------------------------------
@@ -376,6 +570,7 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             data = json.loads(raw)
 
         if not data.get("success"):
+            self._forget_token_if_rejected(data)
             raise UpdateFailed(
                 f"Tuya device info error {data.get('code')}: {data.get('msg')}"
             )
@@ -395,6 +590,7 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             data = json.loads(raw)
 
         if not data.get("success"):
+            self._forget_token_if_rejected(data)
             raise UpdateFailed(
                 f"Tuya device status error {data.get('code')}: {data.get('msg')}"
             )
@@ -417,20 +613,20 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 "endpoint is only reachable via the Tuya IoT Platform."
             )
         path = f"/v1.0/devices/{self._device_id}/specifications"
-        async with aiohttp.ClientSession() as session:
-            token = await self._get_token(session)
-            ts = str(int(time.time() * 1000))
-            nonce = uuid.uuid4().hex
-            sign = self._sign(ts, nonce, "GET", path, token)
-            headers = self._base_headers(ts, nonce, sign, token)
-            async with session.get(self._endpoint + path, headers=headers) as resp:
-                raw = await resp.text()
-                try:
-                    data = json.loads(raw)
-                except json.JSONDecodeError as exc:
-                    raise UpdateFailed(
-                        f"Specifications: non-JSON response: {raw[:200]}"
-                    ) from exc
+        session = async_get_clientsession(self.hass)
+        token = await self._get_token(session)
+        ts = str(int(time.time() * 1000))
+        nonce = uuid.uuid4().hex
+        sign = self._sign(ts, nonce, "GET", path, token)
+        headers = self._base_headers(ts, nonce, sign, token)
+        async with session.get(self._endpoint + path, headers=headers) as resp:
+            raw = await resp.text()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                raise UpdateFailed(
+                    f"Specifications: non-JSON response: {raw[:200]}"
+                ) from exc
         if not data.get("success"):
             raise UpdateFailed(
                 f"Specifications error {data.get('code')}: {data.get('msg')}"
@@ -559,59 +755,78 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # Local LAN calls (tinytuya)
     # ------------------------------------------------------------------
 
-    async def _local_get_status(self) -> dict[str, Any]:
+    def _get_local_device(self) -> Any:
+        """Return the cached persistent tinytuya Device (create on demand).
+
+        Must be called from an executor thread while _local_lock is held.
+        """
         import tinytuya  # noqa: PLC0415
 
-        device_id = self._device_id
-        local_ip = self._local_ip
-        local_key = self._local_key
-        version = self._local_version
-
-        def _sync_fetch() -> dict:
+        d = self._local_device
+        if d is None:
             d = tinytuya.Device(
-                dev_id=device_id,
-                address=local_ip,
-                local_key=local_key,
-                version=version,
+                dev_id=self._device_id,
+                address=self._local_ip,
+                local_key=self._local_key,
+                version=self._local_version,
                 connection_timeout=0.3,
                 connection_retry_limit=1,
                 connection_retry_delay=0,
             )
-            return d.status()
+            d.set_socketPersistent(True)
+            self._local_device = d
+        return d
 
-        result: dict = await self.hass.async_add_executor_job(_sync_fetch)
+    def _drop_local_device(self) -> None:
+        """Forget the cached Device so the next call reconnects fresh."""
+        d = self._local_device
+        self._local_device = None
+        if d is not None:
+            try:
+                d.close()
+            except Exception:  # noqa: BLE001
+                pass
 
-        if not result or "Error" in result:
-            raise RuntimeError(
-                f"tinytuya error: {result.get('Error', result) if result else 'no response'}"
-            )
+    async def _local_get_status(self) -> dict[str, Any]:
+        def _sync_fetch() -> dict:
+            return self._get_local_device().status()
+
+        async with self._local_lock:
+            try:
+                result: dict = await self.hass.async_add_executor_job(_sync_fetch)
+            except Exception:
+                self._drop_local_device()
+                raise
+
+            if not result or "Error" in result:
+                self._drop_local_device()
+                raise RuntimeError(
+                    f"tinytuya error: {result.get('Error', result) if result else 'no response'}"
+                )
 
         dps: dict = result.get("dps", {})
         status = {DPS_TO_CODE[str(k)]: v for k, v in dps.items() if str(k) in DPS_TO_CODE}
         return status
 
     async def _local_send_command(self, commands: list[dict]) -> None:
-        import tinytuya  # noqa: PLC0415
-
-        device_id = self._device_id
-        local_ip = self._local_ip
-        local_key = self._local_key
-        version = self._local_version
-
         def _sync_send() -> None:
-            d = tinytuya.Device(
-                dev_id=device_id,
-                address=local_ip,
-                local_key=local_key,
-                version=version,
-            )
+            d = self._get_local_device()
             d.set_socketTimeout(5)
-            for cmd in commands:
-                dp = CODE_TO_DPS.get(cmd["code"])
-                if dp is not None:
-                    d.set_value(dp, cmd["value"])
+            try:
+                for cmd in commands:
+                    dp = CODE_TO_DPS.get(cmd["code"])
+                    if dp is not None:
+                        d.set_value(dp, cmd["value"])
+            finally:
+                # Restore the short status-poll timeout.
+                d.set_socketTimeout(0.3)
 
-        await self.hass.async_add_executor_job(_sync_send)
+        async with self._local_lock:
+            try:
+                await self.hass.async_add_executor_job(_sync_send)
+            except Exception:
+                self._drop_local_device()
+                raise
 
     # ------------------------------------------------------------------
     # Auto-reset helpers
@@ -647,14 +862,18 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._doorbell_reset_unsub = None
         if self.data and self.data.get("status", {}).get("doorbell"):
             new_status = {**self.data["status"], "doorbell": False}
-            self.async_set_updated_data({**self.data, "status": new_status})
+            self._dispatch_updated_data({**self.data, "status": new_status})
 
     def _schedule_unlock_reset(self, key: str) -> None:
         old = self._unlock_reset_unsubs.pop(key, None)
         if old is not None:
             old()  # type: ignore[operator]
+        # The lambda must be marked as a callback: async_call_later infers
+        # the job type from the callable it's given, and an unmarked lambda
+        # is dispatched to the executor thread pool — where the state write
+        # inside _async_clear_unlock is not allowed.
         self._unlock_reset_unsubs[key] = async_call_later(
-            self.hass, 1, lambda _now, k=key: self._async_clear_unlock(k)
+            self.hass, 1, callback(lambda _now, k=key: self._async_clear_unlock(k))
         )
 
     @callback
@@ -662,11 +881,22 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self._unlock_reset_unsubs.pop(key, None)
         if self.data and self.data.get("status", {}).get(key):
             new_status = {**self.data["status"], key: 0}
-            self.async_set_updated_data({**self.data, "status": new_status})
+            self._dispatch_updated_data({**self.data, "status": new_status})
 
     # ------------------------------------------------------------------
 
-    def _build_result(self, status: dict[str, Any], mode: str) -> dict[str, Any]:
+    def _build_result(
+        self,
+        status: dict[str, Any],
+        mode: str,
+        fresh: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        # Hold commanded-but-unconfirmed values over whatever was just polled
+        # (the cloud's /status lags a BLE lock by seconds), and notice writes
+        # the lock never confirmed. `fresh` = the part of `status` that was
+        # just read, when `status` is a merge over older data.
+        self._apply_expectations(status, fresh)
+
         if status.get("doorbell"):
             self._schedule_doorbell_reset()
 
@@ -683,6 +913,11 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             new_raw = status.get(key)
             if new_raw is None or new_raw == 0:
                 continue
+            # A user ID is an int. A bool here means we're decoding some
+            # other device's DP (int(True) == 1 turned a gateway socket's
+            # relay state into an endless "fingerprint #1 unlocked" storm).
+            if isinstance(new_raw, bool):
+                continue
             try:
                 new_id = int(new_raw)
             except (TypeError, ValueError):
@@ -697,18 +932,20 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if old_id == new_id:
                 # Same pulse still being observed — don't re-fire.
                 continue
+            event_time = dt_util.utcnow()
             self._last_user_event[key] = {
                 "id": new_id,
-                "time": dt_util.utcnow(),
+                "time": event_time,
             }
             self.hass.bus.async_fire(
                 EVENT_UNLOCK,
                 {
+                    "entry_id": self._entry_id,
                     "device_id": self._device_id,
                     "device_name": self._cached_meta.get("name", "Tuya Lock"),
-                    "kind": key.removeprefix("unlock_"),
+                    "kind": key,  # unlock_fingerprint / unlock_password / unlock_card
                     "id": new_id,
-                    "time": dt_util.utcnow().isoformat(),
+                    "time": event_time.isoformat(),
                 },
             )
             self._record_unlock_event(key)
@@ -740,10 +977,54 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _refresh_cloud_meta(self, session: aiohttp.ClientSession) -> None:
         token = await self._get_token(session)
+        self._ingest_meta(await self._cloud_device_info(session, token))
+
+    async def _cloud_poll(
+        self, session: aiohttp.ClientSession, token: str
+    ) -> dict[str, Any]:
+        """Metadata AND status in one API call.
+
+        GET /v1.0/devices/{id} embeds the full status array, so polling it
+        costs half of /status plus a periodic metadata refresh — it matters,
+        see UPDATE_INTERVAL — and keeps `online` current on every poll.
+        """
         info = await self._cloud_device_info(session, token)
-        self._cached_meta = info
+        self._ingest_meta(info)
+        embedded = info.get("status")
+        if isinstance(embedded, list) and embedded:
+            return {item["code"]: item["value"] for item in embedded}
+        return await self._cloud_device_status(session, token)
+
+    def _ingest_meta(self, info: dict[str, Any]) -> None:
+        self._cached_meta = {k: v for k, v in info.items() if k != "status"}
         self._last_meta_refresh = time.time()
+
+        # A gateway sub-device (e.g. a BLE DL026HA behind an SG120HA) has no
+        # LAN presence of its own. Any "local IP" given for it is really the
+        # gateway's, and polling that is actively harmful: the gateway
+        # answers with its OWN DPs plus relayed reports from EVERY child
+        # lock, numbered per the child's schema — none of which matches
+        # DPS_TO_CODE (a DL031HA Wi-Fi table) or is routed by cid. Observed:
+        # fingerprint IDs shown as battery %, battery % shown as the last
+        # alarm, both locks mirroring each other's events, and the
+        # gateway's relay state read as a fingerprint unlock every second.
+        if info.get("sub") and not self._is_sub_device:
+            self._is_sub_device = True
+            if self._local_ip:
+                _LOGGER.warning(
+                    "[TuyaLocal] %s is a gateway sub-device (node_id=%s): "
+                    "ignoring local IP %s, which is the gateway's. Local "
+                    "polling is only valid for locks with their own Wi-Fi. "
+                    "Running cloud-only.",
+                    info.get("name", self._device_id),
+                    info.get("node_id"),
+                    self._local_ip,
+                )
+
         if info.get("local_key"):
+            if self._local_key != info["local_key"]:
+                # Key rotated — the cached persistent device is now stale.
+                self._drop_local_device()
             self._local_key = info["local_key"]
 
     # ------------------------------------------------------------------
@@ -776,7 +1057,7 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         need_meta = not self._cached_meta or (now - self._last_meta_refresh) > CLOUD_META_REFRESH
 
-        if self._local_ip:
+        if self.local_polling_enabled:
             # Cloud + local mode. We always poll cloud /status here — even
             # when local is reachable — so externally-triggered events
             # (Tuya app unlocks, fingerprint scans, the auto-lock timer
@@ -786,12 +1067,12 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             cloud_status: dict[str, Any] | None = None
             cloud_err: Exception | None = None
             try:
-                async with aiohttp.ClientSession() as session:
-                    if need_meta:
-                        await self._refresh_cloud_meta(session)
-                    token = await self._get_token(session)
-                    cloud_status = await self._cloud_device_status(session, token)
-                    await self._seed_missing_state(session, token, cloud_status)
+                session = async_get_clientsession(self.hass)
+                if need_meta:
+                    await self._refresh_cloud_meta(session)
+                token = await self._get_token(session)
+                cloud_status = await self._cloud_device_status(session, token)
+                await self._seed_missing_state(session, token, cloud_status)
             except Exception as err:  # noqa: BLE001
                 cloud_err = err
 
@@ -844,11 +1125,10 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             ) from cloud_err
 
         try:
-            async with aiohttp.ClientSession() as session:
-                await self._refresh_cloud_meta(session)
-                token = await self._get_token(session)
-                status = await self._cloud_device_status(session, token)
-                await self._seed_missing_state(session, token, status)
+            session = async_get_clientsession(self.hass)
+            token = await self._get_token(session)
+            status = await self._cloud_poll(session, token)
+            await self._seed_missing_state(session, token, status)
         except Exception as err:  # noqa: BLE001
             if self.data:
                 _LOGGER.warning(
@@ -860,108 +1140,158 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return self._build_result(status, "cloud")
 
     # ------------------------------------------------------------------
-    # Smart Lock cloud API — ticket-based door operate (DL026HA family)
+    # Cloud writes — signed POST with retry
     # ------------------------------------------------------------------
 
-    async def _smart_lock_get_ticket(
-        self, session: aiohttp.ClientSession, token: str
-    ) -> str:
-        path = SMART_LOCK_TICKET_PATH.format(device_id=self._device_id)
-        ts = str(int(time.time() * 1000))
-        nonce = uuid.uuid4().hex
-        sign = self._sign(ts, nonce, "POST", path, token)
-        headers = self._base_headers(ts, nonce, sign, token)
-        headers["Content-Type"] = "application/json"
+    # Pauses before the 2nd and 3rd attempt at a cloud write.
+    _RETRY_DELAYS: tuple[float, ...] = (0.7, 2.0)
+    # Token invalid / expired: drop the cached token and ask again.
+    _TOKEN_ERROR_CODES: frozenset[int] = frozenset({1010, 1011})
+    # "device is offline": the gateway has lost the lock, or the cloud has
+    # lost the gateway. Retrying within seconds doesn't help — fail fast.
+    _OFFLINE_CODE: int = 2001
+    # Per-attempt ceiling. Commands are serialised by _cmd_lock, so a hung
+    # request would otherwise block every later command for this lock.
+    _POST_TIMEOUT: float = 15.0
 
-        async with session.post(self._endpoint + path, headers=headers) as resp:
-            raw = await resp.text()
-            data = json.loads(raw)
+    # Why the most recent cloud write failed, phrased for a UI error toast.
+    last_command_error: str | None = None
 
-        if not data.get("success"):
-            raise UpdateFailed(
-                f"Smart-lock ticket error {data.get('code')}: {data.get('msg')}"
+    async def _cloud_post(
+        self, path: str, body: str | None, what: str
+    ) -> dict[str, Any] | None:
+        """Signed POST to the Tuya OpenAPI, retrying transient failures.
+
+        Returns the decoded response on success, or None once retries are
+        spent (the reason is left in last_command_error). Every write this
+        integration makes is idempotent, so repeating one whose response
+        got lost is safe.
+        """
+        session = async_get_clientsession(self.hass)
+        attempts = len(self._RETRY_DELAYS) + 1
+        err = "unknown error"
+        offline = False
+        for attempt in range(attempts):
+            try:
+                token = await self._get_token(session)
+                ts = str(int(time.time() * 1000))
+                nonce = uuid.uuid4().hex
+                sign = self._sign(ts, nonce, "POST", path, token, body or "")
+                headers = self._base_headers(ts, nonce, sign, token)
+                headers["Content-Type"] = "application/json"
+                async with asyncio.timeout(self._POST_TIMEOUT):
+                    async with session.post(
+                        self._endpoint + path, headers=headers, data=body
+                    ) as resp:
+                        http_status = resp.status
+                        raw = await resp.text()
+                _LOGGER.debug(
+                    "[TuyaCmd] %s → HTTP %d %s", what, http_status, raw
+                )
+                data = json.loads(raw)
+                if data.get("success"):
+                    self.last_command_error = None
+                    return data
+                code = data.get("code")
+                err = f"{code}: {data.get('msg', 'unknown')}"
+                self._forget_token_if_rejected(data)
+                if code == self._OFFLINE_CODE:
+                    offline = True
+                    break
+            except TimeoutError:
+                err = f"no answer from the Tuya cloud in {self._POST_TIMEOUT:.0f} s"
+            except aiohttp.ClientError as exc:
+                err = f"network error: {exc!r}"
+            except (json.JSONDecodeError, UpdateFailed) as exc:
+                err = str(exc)
+
+            if attempt < attempts - 1:
+                _LOGGER.warning(
+                    "[TuyaCmd] Cloud %s failed (%s) — retrying (%d/%d)",
+                    what, err, attempt + 1, attempts - 1,
+                )
+                await asyncio.sleep(self._RETRY_DELAYS[attempt])
+
+        if offline:
+            self.last_command_error = (
+                "The lock is offline — its Bluetooth hub can't reach it "
+                "right now."
             )
-        result = data.get("result") or {}
-        ticket_id = result.get("ticket_id")
-        if not ticket_id:
-            raise UpdateFailed(
-                f"Smart-lock ticket response missing ticket_id: {result}"
-            )
-        return ticket_id
+        else:
+            self.last_command_error = f"Tuya cloud refused the {what} ({err})."
+        _LOGGER.error("[TuyaCmd] Cloud %s failed %s", what, err)
+        return None
+
+    # ------------------------------------------------------------------
+    # Smart Lock cloud API — ticket-based door operate (DL026HA family)
+    # ------------------------------------------------------------------
 
     async def async_smart_lock_door_operate(self, open_lock: bool) -> bool:
         """POST /password-free/door-operate with open=true|false.
 
         open_lock=True  → remote unlock.
         open_lock=False → remote lock (re-engage the latch immediately).
-        Returns True on API success, False otherwise.
+        Returns True on API success, False otherwise (the reason is left in
+        last_command_error).
         """
+        what = "unlock" if open_lock else "lock"
         if not self._cloud_enabled:
+            self.last_command_error = (
+                "Remote unlock/lock needs Tuya cloud credentials."
+            )
             _LOGGER.error(
                 "[SmartLock] Remote unlock/lock requires cloud credentials — "
                 "the Smart Lock API is cloud-only."
             )
             return False
 
-        path = SMART_LOCK_DOOR_OPERATE_PATH.format(device_id=self._device_id)
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                token = await self._get_token(session)
-                ticket_id = await self._smart_lock_get_ticket(session, token)
-                body = json.dumps({"ticket_id": ticket_id, "open": bool(open_lock)})
-
-                ts = str(int(time.time() * 1000))
-                nonce = uuid.uuid4().hex
-                sign = self._sign(ts, nonce, "POST", path, token, body)
-                headers = self._base_headers(ts, nonce, sign, token)
-                headers["Content-Type"] = "application/json"
-
-                async with session.post(
-                    self._endpoint + path, headers=headers, data=body
-                ) as resp:
-                    raw = await resp.text()
-                    _LOGGER.debug(
-                        "[SmartLock] door-operate open=%s status=%d response=%s",
-                        open_lock, resp.status, raw,
-                    )
-                    data = json.loads(raw)
-
-            if not data.get("success"):
+        async with self._cmd_lock:
+            ticket = await self._cloud_post(
+                SMART_LOCK_TICKET_PATH.format(device_id=self._device_id),
+                None,
+                f"{what} ticket",
+            )
+            if ticket is None:
+                return False
+            ticket_id = (ticket.get("result") or {}).get("ticket_id")
+            if not ticket_id:
+                self.last_command_error = "Tuya cloud returned no unlock ticket."
                 _LOGGER.error(
-                    "[SmartLock] door-operate failed code=%s msg=%s",
-                    data.get("code"), data.get("msg"),
+                    "[SmartLock] ticket response missing ticket_id: %s",
+                    ticket.get("result"),
                 )
                 return False
 
-            # Optimistically reflect the commanded motor state. Note the
-            # firmware's lock_motor_state semantic is inverted relative to
-            # the DP name: true = motor in unlocked position, false = locked.
-            # On DL026HA the lock entity ignores motor_state and uses derived
-            # state instead; this update is preserved for non-DL026HA fallback.
-            if self.data is not None and self.data.get("status") is not None:
-                new_status = {
-                    **self.data["status"],
-                    STATUS_LOCK_MOTOR_STATE: bool(open_lock),
-                }
-                self.async_set_updated_data({**self.data, "status": new_status})
+            body = json.dumps({"ticket_id": ticket_id, "open": bool(open_lock)})
+            operated = await self._cloud_post(
+                SMART_LOCK_DOOR_OPERATE_PATH.format(device_id=self._device_id),
+                body,
+                what,
+            )
+            if operated is None:
+                return False
 
-            # Record the action so the derived-state lock entity flips
-            # immediately rather than waiting for a status poll.
-            if open_lock:
-                self._record_unlock_event("ha_door_operate")
-            else:
-                self._record_lock_event("ha_door_operate")
+        # Optimistically reflect the commanded motor state. Note the
+        # firmware's lock_motor_state semantic is inverted relative to
+        # the DP name: true = motor in unlocked position, false = locked.
+        # On DL026HA the lock entity ignores motor_state and uses derived
+        # state instead; this update is preserved for non-DL026HA fallback.
+        if self.data is not None and self.data.get("status") is not None:
+            new_status = {
+                **self.data["status"],
+                STATUS_LOCK_MOTOR_STATE: bool(open_lock),
+            }
+            self._dispatch_updated_data({**self.data, "status": new_status})
 
-            await self.async_watch_lock_state()
-            return True
+        # Record the action so the derived-state lock entity flips
+        # immediately rather than waiting for a status poll.
+        if open_lock:
+            self._record_unlock_event("ha_door_operate")
+        else:
+            self._record_lock_event("ha_door_operate")
 
-        except aiohttp.ClientError as err:
-            _LOGGER.error("[SmartLock] Network error: %s", err)
-            return False
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.error("[SmartLock] Unexpected error: %s", err)
-            return False
+        await self.async_watch_lock_state(watch_motor=True)
+        return True
 
     # Convenience aliases for the lock entity.
     async def async_unlock_door(self) -> bool:
@@ -983,35 +1313,31 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         it (the write is the same as async_exit_passage_mode's relock).
         """
         if not self._cloud_enabled:
+            self.last_command_error = "Locking needs Tuya cloud credentials."
             _LOGGER.error(
                 "[SmartLock] Lock requires cloud credentials — the "
                 "/commands endpoint is cloud-only."
             )
             return False
 
-        ok = await self._cloud_send_command(
-            [{"code": STATUS_AUTOMATIC_LOCK, "value": True}]
-        )
-        if not ok:
-            _LOGGER.error("[SmartLock] async_lock_door: /commands rejected")
-            return False
+        async with self._cmd_lock:
+            # Read before the write: the write flips passage_mode_active.
+            was_passage = self.passage_mode_active
 
-        # If the lock entity was used while passage mode was on, the same
-        # write also exited passage mode — keep our internal flag in sync.
-        if self._passage_mode_active:
-            _LOGGER.info(
-                "[SmartLock] Lock entity used during passage mode — "
-                "exiting passage mode to match"
+            ok = await self._cloud_send_command(
+                [{"code": STATUS_AUTOMATIC_LOCK, "value": True}]
             )
-            self._passage_mode_active = False
-            if self._passage_saved_auto_lock is not None:
-                # Restore the user's auto_lock_time too so the timer is
-                # back to normal after this implicit passage-mode exit.
-                await self._cloud_send_command(
-                    [{"code": STATUS_AUTO_LOCK_TIME,
-                      "value": self._passage_saved_auto_lock}]
+            if not ok:
+                return False
+
+            # Used while passage mode was on, the same write also exited
+            # passage mode — put the user's auto_lock_time back too.
+            if was_passage:
+                _LOGGER.info(
+                    "[SmartLock] Lock entity used during passage mode — "
+                    "exiting passage mode to match"
                 )
-                self._passage_saved_auto_lock = None
+                await self._restore_auto_lock_time()
 
         # Optimistically reflect the commanded motor state for any non-
         # DL026HA fallback consumers; the DL026HA derived-state lock entity
@@ -1021,27 +1347,39 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 **self.data["status"],
                 STATUS_LOCK_MOTOR_STATE: False,  # firmware: false = locked
             }
-            self.async_set_updated_data({**self.data, "status": new_status})
+            self._dispatch_updated_data({**self.data, "status": new_status})
 
         self._record_lock_event("ha_lock_action")
-        await self.async_watch_lock_state()
         return True
 
     # ------------------------------------------------------------------
-    # State watch — burst-poll cloud status after a door-operate call
+    # State watch — burst-poll cloud status after a command
     # ------------------------------------------------------------------
 
     async def async_watch_lock_state(
         self,
-        duration: float = STATE_WATCH_DURATION,
-        interval: float = STATE_WATCH_INTERVAL,
+        duration: float | None = None,
+        interval: float | None = None,
+        watch_motor: bool = False,
     ) -> None:
+        """Poll cloud /status every `interval` s for up to `duration` s.
+
+        Ends early once every commanded DP has been confirmed by the lock
+        and — when watch_motor is set (door-operate) — the motor has been
+        seen to unlock and relock. One task per lock: a second call while
+        it runs just extends the deadline.
+        """
         if not self._cloud_enabled:
             return
+        if duration is None:
+            duration = STATE_WATCH_DURATION
+        if interval is None:
+            interval = STATE_WATCH_INTERVAL
 
         self._state_watch_until = max(
             self._state_watch_until, time.time() + duration
         )
+        self._watch_motor = self._watch_motor or watch_motor
         if self._state_watch_task and not self._state_watch_task.done():
             return
 
@@ -1052,37 +1390,43 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 last_state = self.data.get("status", {}).get(STATUS_LOCK_MOTOR_STATE)
             saw_unlocked = last_state is True
             try:
-                async with aiohttp.ClientSession() as session:
-                    while time.time() < self._state_watch_until:
-                        try:
-                            token = await self._get_token(session)
-                            cloud_status = await self._cloud_device_status(
-                                session, token
+                session = async_get_clientsession(self.hass)
+                while time.time() < self._state_watch_until:
+                    try:
+                        token = await self._get_token(session)
+                        cloud_status = await self._cloud_device_status(
+                            session, token
+                        )
+                        current = cloud_status.get(STATUS_LOCK_MOTOR_STATE)
+                        if self.data is not None:
+                            local_status = self.data.get("status", {})
+                            merged = {**local_status, **cloud_status}
+                            for k in self._LOCAL_ONLY_KEYS:
+                                if k in local_status:
+                                    merged[k] = local_status[k]
+                            self._apply_expectations(merged, fresh=cloud_status)
+                            self._dispatch_updated_data(
+                                {**self.data, "status": merged}
                             )
-                            if self.data is not None:
-                                local_status = self.data.get("status", {})
-                                merged = {**local_status, **cloud_status}
-                                for k in self._LOCAL_ONLY_KEYS:
-                                    if k in local_status:
-                                        merged[k] = local_status[k]
-                                self.async_set_updated_data(
-                                    {**self.data, "status": merged}
-                                )
 
-                            current = cloud_status.get(STATUS_LOCK_MOTOR_STATE)
-                            if current is True:
-                                saw_unlocked = True
-                            if saw_unlocked and current is False:
-                                return
-                        except Exception as err:  # noqa: BLE001
-                            _LOGGER.debug("[TuyaWatch] Poll error: %s", err)
-                        await asyncio.sleep(interval)
+                        if current is True:
+                            saw_unlocked = True
+                        motor_done = not self._watch_motor or (
+                            saw_unlocked and current is False
+                        )
+                        if motor_done and not self._expected:
+                            return
+                    except Exception as err:  # noqa: BLE001
+                        _LOGGER.debug("[TuyaWatch] Poll error: %s", err)
+                    await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 return
             finally:
                 self._state_watch_task = None
+                self._watch_motor = False
 
-        self._state_watch_task = self.hass.async_create_task(
+        # Background: must not hold up HA shutdown for the rest of a burst.
+        self._state_watch_task = self.hass.async_create_background_task(
             _watch(), name="tuya_lock_v2_state_watch"
         )
 
@@ -1094,10 +1438,10 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # writing to them has been observed to cause unintended behaviour.
     # NOTE: STATUS_AUTOMATIC_LOCK is intentionally NOT in this set even though
     # the v1 integration treated it as read-only. Diagnostic testing on
-    # DL026HA firmware (v2.2.1 try_dp_write probe) confirmed it IS writable
-    # and that the DP is mis-named: writing true puts the door into stay-
-    # unlocked / passage mode, writing false relocks. async_enter_passage_mode
-    # / async_exit_passage_mode rely on this.
+    # DL026HA firmware (v2.2.1 try_dp_write probe) confirmed it IS writable,
+    # with the obvious semantics: writing false disables auto-lock (stay-
+    # unlocked / passage mode), writing true re-enables auto-lock and relocks.
+    # async_enter_passage_mode / async_exit_passage_mode rely on this.
     _READ_ONLY_DPS: frozenset[str] = frozenset({
         STATUS_LOCK_MOTOR_STATE,
         "residual_electricity",
@@ -1160,35 +1504,23 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _cloud_send_command(self, commands: list[dict]) -> bool:
         path = f"/v1.0/devices/{self._device_id}/commands"
         body = json.dumps({"commands": commands})
-        ts = str(int(time.time() * 1000))
-        nonce = uuid.uuid4().hex
-
-        try:
-            async with aiohttp.ClientSession() as session:
-                token = await self._get_token(session)
-                sign = self._sign(ts, nonce, "POST", path, token, body)
-                headers = self._base_headers(ts, nonce, sign, token)
-                headers["Content-Type"] = "application/json"
-
-                async with session.post(
-                    self._endpoint + path, headers=headers, data=body
-                ) as resp:
-                    resp.raise_for_status()
-                    data = await resp.json()
-
-            if not data.get("success"):
-                _LOGGER.error(
-                    "[TuyaCmd] Cloud command failed %s: %s",
-                    data.get("code"), data.get("msg"),
-                )
-                return False
-
-            await self.async_request_refresh()
-            return True
-
-        except aiohttp.ClientError as err:
-            _LOGGER.error("[TuyaCmd] Network error sending command: %s", err)
+        if await self._cloud_post(path, body, "command") is None:
             return False
+
+        # "success" only means the cloud queued the write for the gateway.
+        # Show the commanded values now, then watch for the lock to confirm
+        # them. Only DPs the lock actually reports can ever be confirmed, so
+        # write-only DPs (and the diagnostic probe services) are left alone.
+        reported = (self.data or {}).get("status") or {}
+        for cmd in commands:
+            if cmd.get("code") in reported:
+                self._expect(cmd["code"], cmd.get("value"))
+        if self._expected:
+            self._push_expected()
+            await self.async_watch_lock_state(duration=self._CONFIRM_TIMEOUT + 5)
+        else:
+            await self.async_request_refresh()
+        return True
 
     # ------------------------------------------------------------------
     # Passage mode (real, via automatic_lock DP)
@@ -1211,140 +1543,164 @@ class TuyaLockCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     # before async_shutdown runs, the lock will physically re-engage after
     # half an hour rather than stay open indefinitely.
 
+    async def _restore_auto_lock_time(self) -> None:
+        """Undo the 1800 s passage-mode cap on auto_lock_time.
+
+        Caller holds _cmd_lock.
+        """
+        saved = self._passage_saved_auto_lock
+        self._passage_saved_auto_lock = None
+        if saved is None:
+            # We didn't set the cap this session (HA restarted while passage
+            # mode was on, or it was started from the Tuya app). Only step
+            # in if the cap is visibly still there.
+            status = (self.data or {}).get("status") or {}
+            try:
+                current = int(status.get(STATUS_AUTO_LOCK_TIME))
+            except (TypeError, ValueError):
+                return
+            if current != PASSAGE_MODE_MAX_AUTO_LOCK:
+                return
+            saved = AUTO_LOCK_TIME_DEFAULT
+        await self._cloud_send_command(
+            [{"code": STATUS_AUTO_LOCK_TIME, "value": saved}]
+        )
+
     async def async_enter_passage_mode(self) -> bool:
         """Open the door and hold it open via automatic_lock=false.
 
-        Returns True on success, False if the firmware rejected the write.
+        Returns True on success, False if the write failed (the reason is
+        left in last_command_error).
         """
-        if self._passage_mode_active:
-            return True
         if not self._cloud_enabled:
+            self.last_command_error = "Passage mode needs Tuya cloud credentials."
             _LOGGER.error(
                 "[PassageV2] Passage mode requires cloud credentials — "
                 "the writable DP is only reachable via the IoT Platform."
             )
             return False
 
-        # Capture the current auto_lock_time so we can restore it on exit.
-        # If it's already at the max, that almost certainly means a previous
-        # passage-mode run never restored it (HA crashed, or restart while
-        # passage was on). Fall back to AUTO_LOCK_TIME_DEFAULT in that case
-        # so we don't lock the user into permanently-1800 after toggling.
-        current_status = (self.data or {}).get("status", {}) or {}
-        saved_raw = current_status.get(STATUS_AUTO_LOCK_TIME)
-        try:
-            saved_int = int(saved_raw) if saved_raw is not None else None
-        except (TypeError, ValueError):
-            saved_int = None
-        if saved_int == PASSAGE_MODE_MAX_AUTO_LOCK:
-            _LOGGER.warning(
-                "[PassageV2] auto_lock_time was already %d s — assuming a "
-                "previous passage-mode run never restored it. Will restore "
-                "to %d s on exit instead.",
-                saved_int, AUTO_LOCK_TIME_DEFAULT,
-            )
-            self._passage_saved_auto_lock = AUTO_LOCK_TIME_DEFAULT
-        else:
-            self._passage_saved_auto_lock = saved_int
+        async with self._cmd_lock:
+            if self.passage_mode_active:
+                return True
 
-        # Bump auto_lock_time to the maximum as a hardware-level backstop.
-        # If HA crashes mid-passage-mode, the lock will at least re-engage
-        # after this timer fires rather than stay open indefinitely.
-        # Passage-mode writes go straight to /commands rather than through
-        # async_send_command — for BLE sub-devices the local tinytuya path
-        # silently swallows these writes (the gateway accepts them but
-        # doesn't propagate to the lock), which produced the "switch toggles
-        # but nothing happens" symptom in v2.3.0.
-        await self._cloud_send_command(
-            [{"code": STATUS_AUTO_LOCK_TIME, "value": PASSAGE_MODE_MAX_AUTO_LOCK}]
-        )
-
-        # The actual passage-mode toggle.
-        ok = await self._cloud_send_command(
-            [{"code": STATUS_AUTOMATIC_LOCK, "value": False}]
-        )
-        if not ok:
-            _LOGGER.error(
-                "[PassageV2] Firmware rejected automatic_lock=false — "
-                "aborting and restoring auto_lock_time"
-            )
-            if self._passage_saved_auto_lock is not None:
-                await self._cloud_send_command(
-                    [{"code": STATUS_AUTO_LOCK_TIME, "value": self._passage_saved_auto_lock}]
+            # Capture the current auto_lock_time so we can restore it on
+            # exit. If it's already at the max, that almost certainly means
+            # a previous passage-mode run never restored it (HA crashed, or
+            # restart while passage was on). Fall back to
+            # AUTO_LOCK_TIME_DEFAULT in that case so we don't lock the user
+            # into permanently-1800 after toggling.
+            current_status = (self.data or {}).get("status", {}) or {}
+            saved_raw = current_status.get(STATUS_AUTO_LOCK_TIME)
+            try:
+                saved_int = int(saved_raw) if saved_raw is not None else None
+            except (TypeError, ValueError):
+                saved_int = None
+            if saved_int == PASSAGE_MODE_MAX_AUTO_LOCK:
+                _LOGGER.warning(
+                    "[PassageV2] auto_lock_time was already %d s — assuming a "
+                    "previous passage-mode run never restored it. Will restore "
+                    "to %d s on exit instead.",
+                    saved_int, AUTO_LOCK_TIME_DEFAULT,
                 )
-            self._passage_saved_auto_lock = None
-            return False
+                self._passage_saved_auto_lock = AUTO_LOCK_TIME_DEFAULT
+            else:
+                self._passage_saved_auto_lock = saved_int
 
-        self._passage_mode_active = True
+            # Bump auto_lock_time to the maximum as a hardware-level
+            # backstop. If HA crashes mid-passage-mode, the lock will at
+            # least re-engage after this timer fires rather than stay open
+            # indefinitely. Passage-mode writes go straight to /commands
+            # rather than through async_send_command — for BLE sub-devices
+            # the local tinytuya path silently swallows these writes (the
+            # gateway accepts them but doesn't propagate to the lock).
+            await self._cloud_send_command(
+                [{"code": STATUS_AUTO_LOCK_TIME, "value": PASSAGE_MODE_MAX_AUTO_LOCK}]
+            )
+
+            # The actual passage-mode toggle.
+            ok = await self._cloud_send_command(
+                [{"code": STATUS_AUTOMATIC_LOCK, "value": False}]
+            )
+            if not ok:
+                reason = self.last_command_error
+                _LOGGER.error(
+                    "[PassageV2] automatic_lock=false write failed — "
+                    "aborting and restoring auto_lock_time"
+                )
+                await self._restore_auto_lock_time()
+                self.last_command_error = reason
+                return False
+
         _LOGGER.info(
-            "[PassageV2] Passage mode ON (saved auto_lock_time=%s s, "
-            "30-min hardware backstop armed)",
-            self._passage_saved_auto_lock,
+            "[PassageV2] Passage mode ON (30-min hardware backstop armed)"
         )
-
-        # Force a state push so the switch and lock entity reflect the
-        # new mode immediately, without waiting for the next poll.
-        if self.data is not None:
-            self.async_set_updated_data(self.data)
         return True
 
     async def async_exit_passage_mode(self, relock: bool = True) -> bool:
         """Close out passage mode and restore the saved auto_lock_time.
 
-        ``relock`` is preserved for API symmetry but writing
-        automatic_lock=false already relocks the door, so passing False
-        only suppresses that single command.
+        Decided from the lock's own `automatic_lock` DP, not from memory of
+        what we last sent, so it still works after an HA restart. Returns
+        False if the relock write failed — the door is then still in passage
+        mode, and says so.
+
+        ``relock=False`` only restores auto_lock_time.
         """
-        if not self._passage_mode_active:
-            return True
-
-        self._passage_mode_active = False
-
-        if relock:
-            ok = await self._cloud_send_command(
-                [{"code": STATUS_AUTOMATIC_LOCK, "value": True}]
-            )
-            if not ok:
-                _LOGGER.warning(
-                    "[PassageV2] automatic_lock=true write failed — "
-                    "lock will still relock when auto_lock_time expires"
+        async with self._cmd_lock:
+            in_passage = self.passage_mode_active
+            if in_passage and relock:
+                ok = await self._cloud_send_command(
+                    [{"code": STATUS_AUTOMATIC_LOCK, "value": True}]
                 )
-            # Clear the recent-unlock state so the entity flips back to
-            # Locked rather than reporting Unlocked from a pre-passage event.
-            self._record_lock_event("passage_mode_exit")
+                if not ok:
+                    _LOGGER.warning(
+                        "[PassageV2] automatic_lock=true write failed — "
+                        "the door is still in passage mode"
+                    )
+                    return False
+                # Clear the recent-unlock state so the entity flips back to
+                # Locked rather than reporting Unlocked from a pre-passage
+                # event.
+                self._record_lock_event("passage_mode_exit")
 
-        # Restore the user's previous auto_lock_time so normal behaviour
-        # resumes (rather than leaving the 30-minute backstop in place).
-        if self._passage_saved_auto_lock is not None:
-            await self._cloud_send_command(
-                [{"code": STATUS_AUTO_LOCK_TIME, "value": self._passage_saved_auto_lock}]
-            )
-            self._passage_saved_auto_lock = None
+            # Restore the user's previous auto_lock_time so normal behaviour
+            # resumes (rather than leaving the 30-minute backstop in place).
+            reason = self.last_command_error
+            await self._restore_auto_lock_time()
+            self.last_command_error = reason
 
-        _LOGGER.info("[PassageV2] Passage mode OFF")
-
-        if self.data is not None:
-            self.async_set_updated_data(self.data)
+        if in_passage:
+            _LOGGER.info("[PassageV2] Passage mode OFF")
         return True
 
     async def async_shutdown(self) -> None:
-        """Best-effort safety hook called on entry unload / HA stop.
+        """Relock on entry unload / HA stop, then shut the coordinator down.
 
-        If passage mode is currently active, write automatic_lock=false so
-        the door doesn't stay open after HA goes away. The 30-minute
-        auto_lock_time backstop set by async_enter_passage_mode covers
-        the case where this call also fails (e.g. a hard crash).
+        HA calls this itself when the entry unloads. If passage mode is
+        active, write automatic_lock=true (auto-lock back on) so the door
+        doesn't stay open after HA goes away. The 30-minute auto_lock_time
+        backstop set by async_enter_passage_mode covers the case where this
+        call also fails (e.g. a hard crash).
         """
-        if not self._passage_mode_active:
-            return
-        if not self._cloud_enabled:
-            return
-        try:
-            await self._cloud_send_command(
-                [{"code": STATUS_AUTOMATIC_LOCK, "value": True}]
-            )
-            _LOGGER.warning(
-                "[PassageV2] Shutdown: relocked door (passage mode was active)"
-            )
-        except Exception as err:  # noqa: BLE001
-            _LOGGER.error("[PassageV2] Shutdown relock failed: %s", err)
+        if self._cloud_enabled and self.passage_mode_active:
+            try:
+                async with self._cmd_lock:
+                    ok = await self._cloud_send_command(
+                        [{"code": STATUS_AUTOMATIC_LOCK, "value": True}]
+                    )
+                    await self._restore_auto_lock_time()
+                if ok:
+                    _LOGGER.warning(
+                        "[PassageV2] Shutdown: relocked door (passage mode "
+                        "was active)"
+                    )
+                else:
+                    _LOGGER.error(
+                        "[PassageV2] Shutdown relock failed: %s",
+                        self.last_command_error,
+                    )
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.error("[PassageV2] Shutdown relock failed: %s", err)
+        self.async_stop_ping_loop()
+        await super().async_shutdown()

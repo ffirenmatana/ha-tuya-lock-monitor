@@ -20,6 +20,7 @@ from typing import Any
 from homeassistant.components.lock import LockEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
@@ -141,13 +142,19 @@ class TuyaSmartLockV2(CoordinatorEntity[TuyaLockCoordinator], LockEntity):
 
     # ---- commands -------------------------------------------------------
 
+    def _raise_failed(self, action: str) -> None:
+        """Turn a failed command into an error the person tapping can see.
+
+        Failures used to be logged and swallowed, so a tap that did nothing
+        looked exactly like a tap that worked.
+        """
+        reason = self.coordinator.last_command_error or "No reason was given."
+        raise HomeAssistantError(f"Couldn't {action} the door. {reason}")
+
     async def async_unlock(self, **kwargs: Any) -> None:
         if self._uses_smart_lock_api():
-            try:
-                await self.coordinator.async_unlock_door()
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.error("[LockV2] Smart-lock unlock failed: %s", err)
-                raise
+            if not await self.coordinator.async_unlock_door():
+                self._raise_failed("unlock")
             return
 
         await self.coordinator.async_send_command(
@@ -157,16 +164,8 @@ class TuyaSmartLockV2(CoordinatorEntity[TuyaLockCoordinator], LockEntity):
 
     async def async_lock(self, **kwargs: Any) -> None:
         if self._uses_smart_lock_api():
-            try:
-                ok = await self.coordinator.async_lock_door()
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.error("[LockV2] Smart-lock lock failed: %s", err)
-                raise
-            if not ok:
-                _LOGGER.warning(
-                    "[LockV2] door-operate(open=false) did not succeed; "
-                    "the auto-lock timer should still engage shortly."
-                )
+            if not await self.coordinator.async_lock_door():
+                self._raise_failed("lock")
             return
 
         await self.coordinator.async_send_command(

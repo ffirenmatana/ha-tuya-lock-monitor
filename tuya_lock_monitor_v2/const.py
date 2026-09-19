@@ -49,14 +49,25 @@ ENDPOINTS = {
 DEFAULT_ENDPOINT = "https://openapi.tuyaeu.com"
 
 # --- Polling cadences -------------------------------------------------------
-UPDATE_INTERVAL = 60        # cloud-only scheduled refresh (s)
-LOCAL_POLL_INTERVAL = 15    # minimum gap between local tinytuya polls (s)
-PING_INTERVAL = 1           # TCP ping cadence for local mode (s)
-CLOUD_META_REFRESH = 300    # how often to refresh cloud metadata / local_key (s)
+# UPDATE_INTERVAL is set by Tuya's API allowance, not by how fresh we'd like
+# state to be. The IoT Core *Trial* plan allows 26,000 calls/month per cloud
+# project, and suspends service when that runs out. Per month, for 2 locks:
+#     scheduled poll   2 x 30d x 86400 / UPDATE_INTERVAL   (1 call per poll)
+#       @ 600 s ->  8,640        @ 300 s -> 17,280        @ 60 s -> 86,400 (!)
+#     tokens ~700, command writes ~1,000, confirmation bursts ~3,000
+# 600 s lands near 13k (about half the allowance). That is fine because
+# nothing HA does waits on this poll: commanded changes show immediately and
+# are confirmed by a short burst (see _apply_expectations). The poll only
+# picks up changes made OUTSIDE HA (Tuya app, battery, online). Shorten it
+# only on a paid plan — or replace it with Tuya's Pulsar message push.
+UPDATE_INTERVAL = 600       # scheduled cloud refresh (s)
+PING_INTERVAL = 1           # local tinytuya poll cadence (s) — Wi-Fi locks only
+CLOUD_META_REFRESH = 300    # cloud metadata / local_key refresh in cloud+local mode (s)
 
-# State-watch cadence (used after smart-lock door-operate on DL026HA).
+# State-watch cadence: burst-poll /status after a command until the lock
+# confirms it (typically 5-15 s for a BLE lock behind a gateway).
 STATE_WATCH_DURATION = 20.0
-STATE_WATCH_INTERVAL = 2.0
+STATE_WATCH_INTERVAL = 3.0
 
 # --- Local (tinytuya) protocol ---------------------------------------------
 LOCAL_VERSIONS = ["3.3", "3.4", "3.5"]
@@ -118,11 +129,13 @@ AUTO_LOCK_TIME_DEFAULT = 30
 
 # --- Passage mode ----------------------------------------------------------
 # Real passage mode IS reachable on DL026HA firmware: the `automatic_lock` DP
-# is writable and behaves inversely to its name (true → stay unlocked,
-# false → relock). When entering passage mode we also bump `auto_lock_time`
-# to its maximum as a hardware-level safety backstop — if HA crashes before
-# async_shutdown writes automatic_lock=false, the lock still re-engages
-# after this timer fires (worst-case 30 minutes of unlocked exposure).
+# is writable with the obvious semantics — "should the lock auto-lock?":
+#   automatic_lock = false → auto-lock OFF → passage mode ON (stays unlocked)
+#   automatic_lock = true  → auto-lock ON  → relocks immediately
+# When entering passage mode we also bump `auto_lock_time` to its maximum as
+# a hardware-level safety backstop — if HA crashes before async_shutdown
+# writes automatic_lock=true, the lock still re-engages after this timer
+# fires (worst-case 30 minutes of unlocked exposure).
 PASSAGE_MODE_MAX_AUTO_LOCK = 1800   # seconds — max value the DP accepts
 
 # --- Home Assistant bus events --------------------------------------------

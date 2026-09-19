@@ -2,7 +2,8 @@
 
 Entities:
   * Do Not Disturb — when the DP is present on the device.
-  * Passage Mode — emulated via auto_lock_time bump + periodic re-unlock.
+  * Passage Mode — real, via the writable automatic_lock DP (false = stay
+    unlocked, true = relock), with a 30-minute auto_lock_time backstop.
     See coordinator.async_enter_passage_mode for the mechanics. Offered on
     DL026HA-family devices only (detected by presence of lock_motor_state
     or automatic_lock in the status dict) and requires cloud credentials.
@@ -15,6 +16,7 @@ from typing import Any
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity import DeviceInfo, EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -55,7 +57,7 @@ async def async_setup_entry(
 
 
 class TuyaPassageModeSwitch(CoordinatorEntity[TuyaLockCoordinator], SwitchEntity):
-    """Emulated passage mode (auto_lock_time bump + periodic re-unlock)."""
+    """Real passage mode via automatic_lock=false (+ 30-min backstop)."""
 
     _attr_has_entity_name = True
     _attr_name = "Passage Mode"
@@ -87,15 +89,24 @@ class TuyaPassageModeSwitch(CoordinatorEntity[TuyaLockCoordinator], SwitchEntity
             and self.coordinator.cloud_enabled
         )
 
+    def _raise_failed(self, action: str) -> None:
+        # Raised, not just logged: an automation calling this service can
+        # then catch the failure and retry instead of assuming it worked.
+        reason = self.coordinator.last_command_error or "No reason was given."
+        raise HomeAssistantError(f"Couldn't turn passage mode {action}. {reason}")
+
     async def async_turn_on(self, **kwargs: Any) -> None:
         ok = await self.coordinator.async_enter_passage_mode()
+        self.async_write_ha_state()
         if not ok:
             _LOGGER.warning("[PassageV2] Failed to enter passage mode")
-        self.async_write_ha_state()
+            self._raise_failed("on")
 
     async def async_turn_off(self, **kwargs: Any) -> None:
-        await self.coordinator.async_exit_passage_mode()
+        ok = await self.coordinator.async_exit_passage_mode()
         self.async_write_ha_state()
+        if not ok:
+            self._raise_failed("off")
 
 
 class TuyaDoNotDisturbSwitch(CoordinatorEntity[TuyaLockCoordinator], SwitchEntity):
