@@ -57,13 +57,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         local_ip=local_ip,
         local_version=local_version,
         local_key_direct=local_key,
+        entry_id=entry.entry_id,
+        config_entry=entry,
     )
 
     await coordinator.async_config_entry_first_refresh()
 
-    if local_ip:
+    # Not simply `if local_ip`: a gateway sub-device (BLE lock) must never be
+    # polled locally — the coordinator learns that from the first refresh.
+    if coordinator.local_polling_enabled:
         await coordinator.async_start_ping_loop()
-        entry.async_on_unload(coordinator.async_stop_ping_loop)
+    entry.async_on_unload(coordinator.async_stop_ping_loop)
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
 
@@ -80,9 +84,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry.async_on_unload(
         hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _on_ha_stop)
     )
-    # Also relock on integration unload (e.g. when the user disables or
-    # reconfigures the entry while passage mode is on).
-    entry.async_on_unload(coordinator.async_shutdown)
+    # The relock on integration unload (e.g. when the user disables or
+    # reconfigures the entry while passage mode is on) needs no hook here:
+    # HA registers coordinator.async_shutdown on unload by itself.
 
     entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     return True
